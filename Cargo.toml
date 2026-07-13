@@ -1,0 +1,31 @@
+[package]
+name = "wordcloud"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A deterministic word-cloud image generator for Rust"
+license = "MIT AND OFL-1.1"
+readme = "README.md"
+keywords = ["wordcloud", "visualization", "text", "image"]
+categories = ["multimedia::images", "visualization"]
+exclude = ["/wordcloud.png", "/wordcloud-zh.png"]
+
+[lib]
+name = "wordcloud"
+path = "src/lib.rs"
+
+[dependencies]
+fontdue = "0.9.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+thiserror = "2.0.18"
+unicode-segmentation = "1.12.0"
+
+[dev-dependencies]
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+
+[[example]]
+name = "chinese"
+path = "examples/chinese.rs"
