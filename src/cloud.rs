@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fontdue::{Font, FontSettings};
 use image::{ColorType, DynamicImage, ImageFormat, Pixel, Rgb, RgbImage, Rgba, RgbaImage};
@@ -19,6 +21,23 @@ const DEFAULT_WIDTH: u32 = 400;
 const DEFAULT_HEIGHT: u32 = 200;
 const MAX_OUTPUT_PIXELS: u64 = 16_000_000;
 const MAX_WORD_LENGTH_LIMIT: usize = 4_096;
+static DEFAULT_SEED_BASE: OnceLock<u64> = OnceLock::new();
+static DEFAULT_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn default_random_seed() -> u64 {
+    let base = *DEFAULT_SEED_BASE.get_or_init(|| {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        timestamp ^ u64::from(std::process::id()).rotate_left(32)
+    });
+    let sequence = DEFAULT_SEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut value = base.wrapping_add(sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
 
 /// The font input selected on a [`WordCloudBuilder`].
 #[derive(Clone, Debug)]
@@ -168,7 +187,7 @@ impl Default for WordCloudBuilder {
             margin: 2,
             prefer_horizontal: 0.9,
             relative_scaling: 0.5,
-            random_seed: 0,
+            random_seed: default_random_seed(),
             background_color: Rgba([255, 255, 255, 255]),
             font_source: FontSource::default(),
             mask: None,
@@ -252,6 +271,7 @@ impl WordCloudBuilder {
         self
     }
 
+    /// Uses a fixed seed instead of the fresh seed assigned when the builder is created.
     pub fn random_seed(mut self, seed: u64) -> Self {
         self.random_seed = seed;
         self
@@ -1122,6 +1142,14 @@ mod tests {
         let mut rng = StableRng::new(42);
         assert_eq!(rng.next_u64(), 13_679_457_532_755_275_413);
         assert_eq!(rng.next_u64(), 2_949_826_092_126_892_291);
+    }
+
+    #[test]
+    fn builders_receive_distinct_default_seeds() {
+        let first = WordCloudBuilder::new().random_seed;
+        let second = WordCloudBuilder::new().random_seed;
+        assert_ne!(first, second);
+        assert_eq!(WordCloudBuilder::new().random_seed(0).random_seed, 0);
     }
 
     #[test]

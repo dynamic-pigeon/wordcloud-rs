@@ -88,7 +88,7 @@ fn main() -> Result<(), wordcloud::WordCloudError> {
 
 ## 行为说明
 
-- 固定 `random_seed` 时，同一次构建（依赖版本不变）、配置、字体与输入会产生完全相同的布局和像素；自定义 tokenizer/colorizer 也需要是确定性的，才能维持这一保证。
+- 每个 builder 默认会获得一个新的随机种子；显式固定 `random_seed` 时，同一次构建（依赖版本不变）、配置、字体与输入会产生完全相同的布局和像素。自定义 tokenizer/colorizer 也需要是确定性的，才能维持这一保证。
 - 显式词频输入会合并重复词并绕过 tokenizer、大小写转换与 stopwords。
 - 文本入口采用 Unicode word boundary 和英文 stopwords。中文、日文等需要语言分词的文本，建议先用 `jieba-rs` 等工具分词并传词频。
 - 使用 `font_bytes` 可以嵌入应用自己的字体；TTC 字体通过 `font_index` 选择 face。
