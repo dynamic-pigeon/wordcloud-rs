@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 
 use crate::{Result, WordCloudError};
 
@@ -90,13 +90,20 @@ where
             return Err(WordCloudError::InvalidFrequency { word, value });
         }
 
-        let total = merged.entry(word.clone()).or_default();
-        *total += value;
-        if !total.is_finite() {
-            return Err(WordCloudError::InvalidFrequency {
-                word,
-                value: *total,
-            });
+        match merged.entry(word) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            Entry::Occupied(mut entry) => {
+                let total = *entry.get() + value;
+                if !total.is_finite() {
+                    return Err(WordCloudError::InvalidFrequency {
+                        word: entry.key().clone(),
+                        value: total,
+                    });
+                }
+                *entry.get_mut() = total;
+            }
         }
     }
 

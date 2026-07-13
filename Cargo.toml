@@ -29,3 +29,8 @@ path = "examples/basic.rs"
 [[example]]
 name = "chinese"
 path = "examples/chinese.rs"
+
+[[bench]]
+name = "comparison"
+path = "benches/comparison.rs"
+harness = false

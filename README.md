@@ -105,4 +105,9 @@ cargo run --example chinese -- /path/to/chinese-font.ttf
 cargo test
 ```
 
+## 性能比较
+
+仓库包含与 Python `wordcloud` 的可复现完整图片生成 benchmark，运行方法和比较口径见
+[benchmarks/README.md](benchmarks/README.md)。测量结果仅在本地生成，不纳入仓库。
+
 默认字体 `assets/OpenSans-Regular.ttf` 的许可见 `assets/OFL.txt`。库代码使用 MIT License。

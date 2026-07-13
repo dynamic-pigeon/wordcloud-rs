@@ -10,7 +10,7 @@ use crate::bitmap::{AlphaBitmap, BitGrid};
 use crate::color::{ColorContext, Colorizer, Palette, SolidColor};
 use crate::frequency::{collect_frequencies, IntoWordFrequency, WordFrequency};
 use crate::mask::Mask;
-use crate::text::{rasterize_word, supports_word};
+use crate::text::{supports_word, TextRasterizer};
 use crate::tokenizer::{DefaultTokenizer, StopWords, Tokenizer};
 use crate::{Result, WordCloudError};
 
@@ -501,6 +501,10 @@ impl WordCloudBuilder {
                 "is too small to reduce max_font_size at f32 precision",
             ));
         }
+        let mask_occupancy = self
+            .mask
+            .as_ref()
+            .map(|mask| build_mask_occupancy(mask, width, height, self.scale));
 
         Ok(WordCloud {
             width,
@@ -516,7 +520,7 @@ impl WordCloudBuilder {
             random_seed: self.random_seed,
             background_color: self.background_color,
             font,
-            mask: self.mask,
+            mask_occupancy,
             tokenizer: self.tokenizer,
             stopwords: self.stopwords,
             lowercase: self.lowercase,
@@ -545,7 +549,7 @@ pub struct WordCloud {
     random_seed: u64,
     background_color: Rgba<u8>,
     font: Font,
-    mask: Option<Mask>,
+    mask_occupancy: Option<BitGrid>,
     tokenizer: Arc<dyn Tokenizer>,
     stopwords: StopWords,
     lowercase: bool,
@@ -608,7 +612,10 @@ impl WordCloud {
             }
             *counts.entry(word).or_default() += 1;
         }
-        collect_frequencies(counts)
+        collect_frequencies(counts.into_iter().map(|(word, frequency)| WordFrequency {
+            word,
+            frequency: frequency as f64,
+        }))
     }
 
     pub fn generate(&self, text: &str) -> Result<RgbaImage> {
@@ -682,13 +689,16 @@ impl WordCloud {
         }
 
         let max_frequency = renderable[0].1.frequency;
+        let attempted = renderable.len();
         let mut occupied = self.initial_occupancy();
+        let mut text_rasterizer = TextRasterizer::new();
         let mut layout_rng = StableRng::new(self.random_seed ^ 0x4c41_594f_5554_5f31);
         let mut color_rng = StableRng::new(self.random_seed ^ 0x434f_4c4f_5253_5f31);
-        let mut placed = Vec::<PlacedRaster>::new();
+        let mut placed = Vec::<PlacedWord>::new();
+        let mut image = None;
         let mut previous: Option<(f64, f32)> = None;
 
-        for (rank, frequency) in &renderable {
+        for (rank, frequency) in renderable {
             let normalized_frequency = (frequency.frequency / max_frequency) as f32;
             let target_size = previous
                 .map(|(previous_frequency, previous_size)| {
@@ -697,41 +707,75 @@ impl WordCloud {
                 })
                 .unwrap_or(self.max_font_size)
                 .clamp(self.min_font_size, self.max_font_size);
-            let orientations = self.orientation_order(&mut layout_rng);
+            let (orientations, orientation_count) = self.orientation_order(&mut layout_rng);
             let mut font_size = target_size.floor().max(self.min_font_size);
             let mut selected = None;
 
             loop {
                 let usable_width = self.width - self.margin * 2;
                 let usable_height = self.height - self.margin * 2;
-                if let Some(horizontal) = rasterize_word(
+                if let Some(horizontal) = text_rasterizer.rasterize_word(
                     &self.font,
                     &frequency.word,
                     font_size,
                     usable_width,
                     usable_height,
                 ) {
-                    for orientation in &orientations {
-                        let bitmap = match orientation {
-                            Orientation::Horizontal => horizontal.clone(),
-                            Orientation::Vertical => horizontal.rotate_clockwise(),
-                        };
-                        let Some(collision) = bitmap.dilated_bits(self.margin) else {
-                            continue;
-                        };
-                        if collision.width() > self.width || collision.height() > self.height {
-                            continue;
-                        }
-                        if let Some((collision_x, collision_y)) = find_position(
-                            &occupied,
-                            &collision,
-                            self.search_attempts,
-                            &mut layout_rng,
-                        ) {
-                            let x = collision_x + self.margin;
-                            let y = collision_y + self.margin;
-                            selected = Some((bitmap, *orientation, x, y));
-                            break;
+                    let mut horizontal = Some(horizontal);
+                    for orientation in orientations[..orientation_count].iter().copied() {
+                        match orientation {
+                            Orientation::Horizontal => {
+                                let bitmap = horizontal
+                                    .as_ref()
+                                    .expect("horizontal bitmap must be available");
+                                if let Some((x, y, ink)) = find_bitmap_position(
+                                    &occupied,
+                                    bitmap,
+                                    self.margin,
+                                    self.width,
+                                    self.height,
+                                    self.search_attempts,
+                                    &mut layout_rng,
+                                ) {
+                                    selected = Some((
+                                        horizontal
+                                            .take()
+                                            .expect("selected horizontal bitmap must be available"),
+                                        ink,
+                                        orientation,
+                                        x,
+                                        y,
+                                    ));
+                                    break;
+                                }
+                            }
+                            Orientation::Vertical => {
+                                let horizontal_bitmap = horizontal
+                                    .as_ref()
+                                    .expect("horizontal bitmap must be available");
+                                if !bitmap_fits_with_margin(
+                                    horizontal_bitmap.height,
+                                    horizontal_bitmap.width,
+                                    self.margin,
+                                    self.width,
+                                    self.height,
+                                ) {
+                                    continue;
+                                }
+                                let bitmap = horizontal_bitmap.rotate_clockwise();
+                                if let Some((x, y, ink)) = find_bitmap_position(
+                                    &occupied,
+                                    &bitmap,
+                                    self.margin,
+                                    self.width,
+                                    self.height,
+                                    self.search_attempts,
+                                    &mut layout_rng,
+                                ) {
+                                    selected = Some((bitmap, ink, orientation, x, y));
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -741,10 +785,9 @@ impl WordCloud {
                 font_size = next_font_size(font_size, self.font_step, self.min_font_size);
             }
 
-            let Some((bitmap, orientation, x, y)) = selected else {
+            let Some((bitmap, ink, orientation, x, y)) = selected else {
                 continue;
             };
-            let ink = bitmap.bits();
             if !occupied.insert(&ink, x, y) {
                 continue;
             }
@@ -753,7 +796,7 @@ impl WordCloud {
                 word: &frequency.word,
                 frequency: frequency.frequency,
                 normalized_frequency,
-                rank: *rank,
+                rank,
                 font_size,
                 orientation,
                 x,
@@ -761,10 +804,10 @@ impl WordCloud {
                 random,
             });
             let metadata = PlacedWord {
-                word: frequency.word.clone(),
+                word: frequency.word,
                 frequency: frequency.frequency,
                 normalized_frequency,
-                rank: *rank,
+                rank,
                 x,
                 y,
                 width: bitmap.width,
@@ -773,60 +816,41 @@ impl WordCloud {
                 orientation,
                 color,
             };
-            placed.push(PlacedRaster { metadata, bitmap });
+            let image = image.get_or_insert_with(|| {
+                RgbaImage::from_pixel(self.width, self.height, self.background_color)
+            });
+            blend_bitmap(image, &bitmap, &metadata);
+            placed.push(metadata);
             previous = Some((frequency.frequency, font_size));
         }
 
         if placed.is_empty() {
-            return Err(WordCloudError::NoWordsPlaced {
-                attempted: renderable.len(),
-            });
+            return Err(WordCloudError::NoWordsPlaced { attempted });
         }
 
-        let mut image = RgbaImage::from_pixel(self.width, self.height, self.background_color);
-        for word in &placed {
-            blend_bitmap(&mut image, &word.bitmap, &word.metadata);
-        }
-        let words = placed.into_iter().map(|word| word.metadata).collect();
-        Ok(RenderedWordCloud { image, words })
+        Ok(RenderedWordCloud {
+            image: image.expect("a non-empty placement must initialize the image"),
+            words: placed,
+        })
     }
 
     fn initial_occupancy(&self) -> BitGrid {
-        let mut occupied = BitGrid::new(self.width, self.height);
-        let Some(mask) = &self.mask else {
-            return occupied;
-        };
-        let logical_width = mask.width();
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let mask_x = (x / self.scale).min(logical_width - 1);
-                let mask_y = (y / self.scale).min(mask.height() - 1);
-                if !mask.allowed_pixels()
-                    [(mask_y as usize) * (logical_width as usize) + mask_x as usize]
-                {
-                    occupied.set(x, y);
-                }
-            }
-        }
-        occupied
+        self.mask_occupancy
+            .clone()
+            .unwrap_or_else(|| BitGrid::new(self.width, self.height))
     }
 
-    fn orientation_order(&self, rng: &mut StableRng) -> Vec<Orientation> {
+    fn orientation_order(&self, rng: &mut StableRng) -> ([Orientation; 2], usize) {
         if self.prefer_horizontal >= 1.0 {
-            vec![Orientation::Horizontal]
+            ([Orientation::Horizontal, Orientation::Vertical], 1)
         } else if self.prefer_horizontal <= 0.0 {
-            vec![Orientation::Vertical]
+            ([Orientation::Vertical, Orientation::Horizontal], 1)
         } else if rng.unit_f32() < self.prefer_horizontal {
-            vec![Orientation::Horizontal, Orientation::Vertical]
+            ([Orientation::Horizontal, Orientation::Vertical], 2)
         } else {
-            vec![Orientation::Vertical, Orientation::Horizontal]
+            ([Orientation::Vertical, Orientation::Horizontal], 2)
         }
     }
-}
-
-struct PlacedRaster {
-    metadata: PlacedWord,
-    bitmap: AlphaBitmap,
 }
 
 fn load_font(source: &FontSource) -> Result<Font> {
@@ -907,6 +931,70 @@ fn next_font_size(current: f32, step: f32, minimum: f32) -> f32 {
     }
 }
 
+fn build_mask_occupancy(mask: &Mask, width: u32, height: u32, scale: u32) -> BitGrid {
+    debug_assert_eq!(width, mask.width() * scale);
+    debug_assert_eq!(height, mask.height() * scale);
+    let mut occupied = BitGrid::new(width, height);
+    for mask_y in 0..mask.height() {
+        for mask_x in 0..mask.width() {
+            if mask.allowed_pixels()[(mask_y as usize) * (mask.width() as usize) + mask_x as usize]
+            {
+                continue;
+            }
+            let start_x = mask_x * scale;
+            let start_y = mask_y * scale;
+            for y in start_y..start_y + scale {
+                for x in start_x..start_x + scale {
+                    occupied.set(x, y);
+                }
+            }
+        }
+    }
+    occupied
+}
+
+fn bitmap_fits_with_margin(
+    width: u32,
+    height: u32,
+    margin: u32,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> bool {
+    let Some(padding) = margin.checked_mul(2) else {
+        return false;
+    };
+    width
+        .checked_add(padding)
+        .is_some_and(|width| width <= canvas_width)
+        && height
+            .checked_add(padding)
+            .is_some_and(|height| height <= canvas_height)
+}
+
+fn find_bitmap_position(
+    occupied: &BitGrid,
+    bitmap: &AlphaBitmap,
+    margin: u32,
+    canvas_width: u32,
+    canvas_height: u32,
+    attempts: usize,
+    rng: &mut StableRng,
+) -> Option<(u32, u32, BitGrid)> {
+    if !bitmap_fits_with_margin(
+        bitmap.width,
+        bitmap.height,
+        margin,
+        canvas_width,
+        canvas_height,
+    ) {
+        return None;
+    }
+    let (ink, collision) = bitmap.placement_bits(margin)?;
+    let (collision_x, collision_y) = find_position(occupied, &collision, attempts, rng)?;
+    let ink = ink.unwrap_or_else(|| bitmap.bits());
+    Some((collision_x + margin, collision_y + margin, ink))
+}
+
 fn find_position(
     occupied: &BitGrid,
     candidate: &BitGrid,
@@ -955,7 +1043,7 @@ fn find_position(
 }
 
 fn position_is_free(occupied: &BitGrid, candidate: &BitGrid, x: u32, y: u32) -> bool {
-    !occupied.collides(candidate, x, y)
+    !occupied.collides_in_bounds(candidate, x, y)
 }
 
 fn gcd(mut left: u64, mut right: u64) -> u64 {
@@ -968,15 +1056,27 @@ fn gcd(mut left: u64, mut right: u64) -> u64 {
 }
 
 fn blend_bitmap(image: &mut RgbaImage, bitmap: &AlphaBitmap, word: &PlacedWord) {
-    for y in 0..bitmap.height {
-        for x in 0..bitmap.width {
-            let coverage = bitmap.alpha[(y * bitmap.width + x) as usize];
+    let image_width = image.width() as usize;
+    let bitmap_width = bitmap.width as usize;
+    let word_x = word.x as usize;
+    let word_y = word.y as usize;
+    let image_data = image.as_mut();
+    for y in 0..bitmap.height as usize {
+        let alpha_start = y * bitmap_width;
+        let alpha_row = &bitmap.alpha[alpha_start..alpha_start + bitmap_width];
+        let target_start = ((word_y + y) * image_width + word_x) * 4;
+        let target_row = &mut image_data[target_start..target_start + bitmap_width * 4];
+        for (coverage, target) in alpha_row
+            .iter()
+            .copied()
+            .zip(target_row.chunks_exact_mut(4))
+        {
             if coverage == 0 {
                 continue;
             }
             let mut source = word.color;
             source[3] = ((u16::from(source[3]) * u16::from(coverage) + 127) / 255) as u8;
-            image.get_pixel_mut(word.x + x, word.y + y).blend(&source);
+            Rgba::from_slice_mut(target).blend(&source);
         }
     }
 }
@@ -1050,6 +1150,91 @@ mod tests {
     }
 
     #[test]
+    fn blend_bitmap_matches_image_blend_for_alpha_matrix() {
+        let destinations = [
+            Rgba([7, 31, 83, 0]),
+            Rgba([17, 29, 43, 73]),
+            Rgba([241, 243, 247, 255]),
+        ];
+        for coverage in [0, 1, 127, 128, 254, 255] {
+            for word_alpha in [0, 1, 128, 254, 255] {
+                for destination in destinations {
+                    let bitmap = AlphaBitmap {
+                        width: 1,
+                        height: 1,
+                        alpha: vec![coverage],
+                    };
+                    let word = PlacedWord {
+                        word: "x".to_owned(),
+                        frequency: 1.0,
+                        normalized_frequency: 1.0,
+                        rank: 0,
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                        font_size: 10.0,
+                        orientation: Orientation::Horizontal,
+                        color: Rgba([193, 97, 41, word_alpha]),
+                    };
+                    let mut expected = destination;
+                    let mut source = word.color;
+                    source[3] = ((u16::from(word_alpha) * u16::from(coverage) + 127) / 255) as u8;
+                    expected.blend(&source);
+
+                    let mut image = RgbaImage::from_pixel(1, 1, destination);
+                    blend_bitmap(&mut image, &bitmap, &word);
+                    assert_eq!(image[(0, 0)], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_mask_occupancy_matches_pixel_mapping() {
+        for logical_width in [63, 64, 65, 127] {
+            let logical_height = 7;
+            let mask = Mask::from_predicate(logical_width, logical_height, |x, y| {
+                (x.wrapping_mul(17) + y * 11) % 13 > 3
+            })
+            .unwrap();
+            for scale in [1, 2, 3] {
+                let width = logical_width * scale;
+                let height = logical_height * scale;
+                let occupied = build_mask_occupancy(&mask, width, height, scale);
+                for y in 0..height {
+                    for x in 0..width {
+                        assert_eq!(occupied.get(x, y), !mask.is_allowed(x / scale, y / scale));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_mask_is_not_mutated_between_generations() {
+        let mask = Mask::from_predicate(127, 83, |x, y| {
+            x > 2 && y > 1 && x < 124 && y < 81 && !((47..80).contains(&x) && y < 27)
+        })
+        .unwrap();
+        let cloud = WordCloud::builder()
+            .mask(mask)
+            .scale(2)
+            .random_seed(77)
+            .build()
+            .unwrap();
+        let frequencies = [("mask", 10), ("cached", 8), ("layout", 6), ("pixels", 4)];
+        let first = cloud
+            .generate_detailed_from_frequencies(frequencies)
+            .unwrap();
+        let second = cloud
+            .generate_detailed_from_frequencies(frequencies)
+            .unwrap();
+        assert_eq!(first.words(), second.words());
+        assert_eq!(first.image().as_raw(), second.image().as_raw());
+    }
+
+    #[test]
     fn generated_ink_is_in_bounds_and_never_overlaps() {
         let cloud = WordCloud::builder()
             .dimensions(520, 300)
@@ -1075,16 +1260,18 @@ mod tests {
         let mut occupied = BitGrid::new(cloud.width, cloud.height);
         let usable_width = cloud.width - cloud.margin * 2;
         let usable_height = cloud.height - cloud.margin * 2;
+        let mut text_rasterizer = TextRasterizer::new();
 
         for word in rendered.words() {
-            let horizontal = rasterize_word(
-                &cloud.font,
-                &word.word,
-                word.font_size,
-                usable_width,
-                usable_height,
-            )
-            .unwrap();
+            let horizontal = text_rasterizer
+                .rasterize_word(
+                    &cloud.font,
+                    &word.word,
+                    word.font_size,
+                    usable_width,
+                    usable_height,
+                )
+                .unwrap();
             let bitmap = match word.orientation {
                 Orientation::Horizontal => horizontal,
                 Orientation::Vertical => horizontal.rotate_clockwise(),

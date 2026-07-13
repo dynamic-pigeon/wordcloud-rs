@@ -1,4 +1,7 @@
 /target/
+/.venv-benchmark/
+/.ruff_cache/
+/benchmarks/results/
+__pycache__/
 /wordcloud.png
 /wordcloud-zh.png
-
