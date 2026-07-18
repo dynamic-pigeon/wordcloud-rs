@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fontdue::{Font, FontSettings};
+use ab_glyph::{FontArc, FontVec};
 use image::{ColorType, DynamicImage, ImageFormat, Pixel, Rgb, RgbImage, Rgba, RgbaImage};
 
 use crate::bitmap::{AlphaBitmap, BitGrid};
@@ -568,7 +568,7 @@ pub struct WordCloud {
     relative_scaling: f32,
     random_seed: u64,
     background_color: Rgba<u8>,
-    font: Font,
+    font: FontArc,
     mask_occupancy: Option<BitGrid>,
     tokenizer: Arc<dyn Tokenizer>,
     stopwords: StopWords,
@@ -887,28 +887,23 @@ impl WordCloud {
     }
 }
 
-fn load_font(source: &FontSource) -> Result<Font> {
-    let (bytes, index): (Arc<[u8]>, u32) = match source {
-        FontSource::Embedded { index } => (Arc::from(DEFAULT_FONT), *index),
+fn load_font(source: &FontSource) -> Result<FontArc> {
+    let (bytes, index): (Vec<u8>, u32) = match source {
+        FontSource::Embedded { index } => (DEFAULT_FONT.to_vec(), *index),
         FontSource::Path { path, index } => {
             let bytes = fs::read(path).map_err(|source| WordCloudError::FontRead {
                 path: path.clone(),
                 source,
             })?;
-            (Arc::from(bytes), *index)
+            (bytes, *index)
         }
-        FontSource::Bytes { data, index } => (Arc::clone(data), *index),
+        FontSource::Bytes { data, index } => (data.to_vec(), *index),
     };
-    Font::from_bytes(
-        bytes,
-        FontSettings {
-            collection_index: index,
-            ..FontSettings::default()
-        },
-    )
-    .map_err(|reason| WordCloudError::InvalidFont {
-        reason: reason.to_owned(),
-    })
+    FontVec::try_from_vec_and_index(bytes, index)
+        .map(FontArc::new)
+        .map_err(|reason| WordCloudError::InvalidFont {
+            reason: reason.to_string(),
+        })
 }
 
 fn validate_positive_u32(parameter: &'static str, value: u32) -> Result<()> {

@@ -44,14 +44,14 @@ python3.12 -m venv .venv-benchmark
 ## 如何解读
 
 这是库级端到端性能比较，不是相同算法的 Rust/Python 语言微基准。Python 使用
-Pillow/FreeType 栅格化和积分图矩形搜索；当前 Rust 库使用 `fontdue`、紧凑 `u64`
+Pillow/FreeType 栅格化和积分图矩形搜索；当前 Rust 库使用 `ab_glyph`、紧凑 `u64`
 位图和精确 glyph alpha 碰撞，并限制候选位置搜索次数。Python 在布局后还会在
 `to_image()` 中重新栅格化文字，而 Rust 复用本轮布局生成的 alpha 位图完成混合。
 
 因此，即使字体、词频和主要参数一致，两端也不会产生相同坐标或像素。固定 seed
 只保证各自重复运行稳定，不能统一不同 RNG 和搜索算法。最终结果还应结合放置词数判断；
 如果某个自定义负载中两端放置数量或字号不同，不能只看总耗时比。即使固定字号完全
-一致，FreeType 与 `fontdue` 的字形边界和覆盖像素也不同，结果仍是端点比较而非同算法比较。
+一致，FreeType 与 `ab_glyph` 的字形边界和覆盖像素也不同，结果仍是端点比较而非同算法比较。
 
 测量结果写入 `--output` 指定的 JSON 文件。`benchmarks/results/` 已被 Git 忽略，
 用于保存本机临时结果。

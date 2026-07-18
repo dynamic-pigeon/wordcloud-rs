@@ -92,7 +92,7 @@ fn main() -> Result<(), wordcloud::WordCloudError> {
 - 显式词频输入会合并重复词并绕过 tokenizer、大小写转换与 stopwords。
 - 文本入口采用 Unicode word boundary 和英文 stopwords。中文、日文等需要语言分词的文本，建议先用 `jieba-rs` 等工具分词并传词频。
 - 使用 `font_bytes` 可以嵌入应用自己的字体；TTC 字体通过 `font_index` 选择 face。
-- 字形栅格化基于 `fontdue`。当前版本适合 Latin、CJK 等无需复杂 shaping 的文本；阿拉伯文、部分印度文字和彩色 emoji 的高级 shaping/彩色字形尚未实现。
+- 字形栅格化基于 `ab_glyph`。当前版本适合 Latin、CJK 等无需复杂 shaping 的文本；阿拉伯文、部分印度文字和彩色 emoji 的高级 shaping/彩色字形尚未实现。
 - `scale(n)` 会把画布、字号、margin 和 mask 同步放大，并在物理像素上重新布局和碰撞；输出尺寸为 `width*n` x `height*n`。
 - 默认单词长度上限为 256 个 Unicode 字符，可通过 `max_word_length` 调整（硬上限 4096）；输出画布上限为 1600 万像素，以避免依赖端意外的大额内存分配。
 - `save` 根据扩展名支持 PNG、JPEG 和 WebP；未知或未启用的格式会返回 `WordCloudError::Image`。

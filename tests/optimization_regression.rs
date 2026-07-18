@@ -84,6 +84,8 @@ fn orientation_counts(rendered: &RenderedWordCloud) -> (usize, usize) {
 
 #[test]
 fn optimized_pipeline_matches_reference_fingerprints() {
+    // Baselines were regenerated when the font engine migrated from fontdue
+    // to ab_glyph; rendering differences between engines are expected.
     let mut actual = Vec::new();
     let horizontal = render(
         builder(321, 179)
@@ -100,7 +102,7 @@ fn optimized_pipeline_matches_reference_fingerprints() {
             .prefer_horizontal(0.45)
             .random_seed(22),
     );
-    assert_eq!(orientation_counts(&mixed), (10, 2));
+    assert_eq!(orientation_counts(&mixed), (6, 6));
     actual.push(("mixed_margin_2", fingerprint(&mixed)));
 
     let vertical = render(
@@ -160,16 +162,16 @@ fn optimized_pipeline_matches_reference_fingerprints() {
         ));
     }
 
-    let expected = [
-        ("horizontal_margin_0", 0xbae1_e60e_cf53_3b8d),
-        ("mixed_margin_2", 0x90ae_e061_a81e_268e),
-        ("vertical_margin_2", 0x0a23_e71f_beae_f828),
-        ("mask_scale_3", 0x790b_fc09_c9af_410c),
-        ("transparent_alpha", 0x00ca_da41_f8b1_5b2e),
-        ("margin_1", 0x5135_339b_78b9_2b99),
-        ("margin_2", 0x6d5d_2113_cc11_fec7),
-        ("margin_8", 0x44b5_f38a_ea48_2a3b),
-        ("margin_9", 0x00d3_d51c_ffc8_8b5a),
+    let expected: [(&str, u64); 9] = [
+        ("horizontal_margin_0", 0xd9a0_33df_e5fa_66a2),
+        ("mixed_margin_2", 0xc3a1_c2c6_7375_95df),
+        ("vertical_margin_2", 0xa175_b3df_e8cc_881f),
+        ("mask_scale_3", 0x9252_0ca3_3191_8b2d),
+        ("transparent_alpha", 0xc44f_d648_a4ee_9aec),
+        ("margin_1", 0xf29d_4dcc_79e8_bba4),
+        ("margin_2", 0x037c_89c0_780b_f06b),
+        ("margin_8", 0x2014_ad5d_ce6e_26c0),
+        ("margin_9", 0xa948_4c4a_194f_a63e),
     ];
     assert_eq!(actual, expected);
 }
