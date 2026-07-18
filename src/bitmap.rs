@@ -6,8 +6,6 @@ pub(crate) struct AlphaBitmap {
 }
 
 impl AlphaBitmap {
-    const WORDWISE_DILATION_MAX_RADIUS: u32 = 8;
-
     pub fn rotate_clockwise(&self) -> Self {
         let mut alpha = vec![0; self.alpha.len()];
         for y in 0..self.height {
@@ -26,6 +24,7 @@ impl AlphaBitmap {
         }
     }
 
+    #[cfg(test)]
     pub fn bits(&self) -> BitGrid {
         let mut bits = BitGrid::new(self.width, self.height);
         for y in 0..self.height {
@@ -36,118 +35,6 @@ impl AlphaBitmap {
             }
         }
         bits
-    }
-
-    /// Returns an ink mask expanded by `radius`, with the original bitmap
-    /// located at `(radius, radius)` inside it.
-    #[cfg(test)]
-    pub fn dilated_bits(&self, radius: u32) -> Option<BitGrid> {
-        self.placement_bits(radius).map(|(_, dilated)| dilated)
-    }
-
-    /// Returns the collision mask and, when its construction already required
-    /// it, an ink mask that can be reused after placement succeeds.
-    pub fn placement_bits(&self, radius: u32) -> Option<(Option<BitGrid>, BitGrid)> {
-        let width = self.width.checked_add(radius.checked_mul(2)?)?;
-        let height = self.height.checked_add(radius.checked_mul(2)?)?;
-        if radius == 0 {
-            let ink = self.bits();
-            return Some((Some(ink.clone()), ink));
-        }
-
-        let diameter = radius.checked_mul(2)?.checked_add(1)?;
-        if radius <= Self::WORDWISE_DILATION_MAX_RADIUS {
-            let ink = self.bits();
-            let dilated = self.dilated_bits_wordwise(&ink, width, height, diameter);
-            Some((Some(ink), dilated))
-        } else {
-            let dilated = self.dilated_bits_sliding(width, height, diameter);
-            Some((None, dilated))
-        }
-    }
-
-    fn dilated_bits_sliding(&self, width: u32, height: u32, diameter: u32) -> BitGrid {
-        // Two sliding-window passes perform a square dilation in O(output
-        // area) while retaining the compact bit-grid memory footprint.
-        let mut horizontal = BitGrid::new(width, self.height);
-        for y in 0..self.height {
-            let mut ink_count = 0_u32;
-            for output_x in 0..width {
-                if output_x < self.width && self.alpha[(y * self.width + output_x) as usize] != 0 {
-                    ink_count += 1;
-                }
-                if let Some(expired_x) = output_x.checked_sub(diameter) {
-                    if expired_x < self.width
-                        && self.alpha[(y * self.width + expired_x) as usize] != 0
-                    {
-                        ink_count -= 1;
-                    }
-                }
-                if ink_count != 0 {
-                    horizontal.set(output_x, y);
-                }
-            }
-        }
-
-        let mut dilated = BitGrid::new(width, height);
-        for x in 0..width {
-            let mut ink_count = 0_u32;
-            for output_y in 0..height {
-                if output_y < self.height && horizontal.get(x, output_y) {
-                    ink_count += 1;
-                }
-                if let Some(expired_y) = output_y.checked_sub(diameter) {
-                    if expired_y < self.height && horizontal.get(x, expired_y) {
-                        ink_count -= 1;
-                    }
-                }
-                if ink_count != 0 {
-                    dilated.set(x, output_y);
-                }
-            }
-        }
-        dilated
-    }
-
-    fn dilated_bits_wordwise(
-        &self,
-        ink: &BitGrid,
-        width: u32,
-        height: u32,
-        diameter: u32,
-    ) -> BitGrid {
-        let mut dilated = BitGrid::new(width, height);
-        let mut expanded_row = vec![0_u64; dilated.stride];
-
-        for source_y in 0..self.height as usize {
-            expanded_row.fill(0);
-            let source_start = source_y * ink.stride;
-            for source_word in 0..ink.stride {
-                let value = ink.rows[source_start + source_word];
-                if value == 0 {
-                    continue;
-                }
-
-                for shift in 0..diameter {
-                    expanded_row[source_word] |= value << shift;
-                    if shift != 0 && source_word + 1 < expanded_row.len() {
-                        expanded_row[source_word + 1] |= value >> (64 - shift);
-                    }
-                }
-            }
-
-            for target_y in source_y..source_y + diameter as usize {
-                let target_start = target_y * dilated.stride;
-                for (target, expanded) in dilated.rows[target_start..target_start + dilated.stride]
-                    .iter_mut()
-                    .zip(&expanded_row)
-                {
-                    *target |= *expanded;
-                }
-            }
-        }
-
-        dilated
     }
 }
 
@@ -176,6 +63,115 @@ impl BitGrid {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// Returns a copy rotated 90 degrees clockwise, matching
+    /// [`AlphaBitmap::rotate_clockwise`].
+    pub fn rotate_clockwise(&self) -> Self {
+        let mut rotated = Self::new(self.height, self.width);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.get(x, y) {
+                    rotated.set(self.height - 1 - y, x);
+                }
+            }
+        }
+        rotated
+    }
+
+    /// Returns an ink mask expanded by `radius`, with the original grid
+    /// located at `(radius, radius)` inside it.
+    pub fn dilated(&self, radius: u32) -> Option<Self> {
+        const WORDWISE_DILATION_MAX_RADIUS: u32 = 8;
+
+        let width = self.width.checked_add(radius.checked_mul(2)?)?;
+        let height = self.height.checked_add(radius.checked_mul(2)?)?;
+        if radius == 0 {
+            return Some(self.clone());
+        }
+
+        let diameter = radius.checked_mul(2)?.checked_add(1)?;
+        if radius <= WORDWISE_DILATION_MAX_RADIUS {
+            Some(self.dilated_wordwise(width, height, diameter))
+        } else {
+            Some(self.dilated_sliding(width, height, diameter))
+        }
+    }
+
+    fn dilated_sliding(&self, width: u32, height: u32, diameter: u32) -> Self {
+        // Two sliding-window passes perform a square dilation in O(output
+        // area) while retaining the compact bit-grid memory footprint.
+        let mut horizontal = Self::new(width, self.height);
+        for y in 0..self.height {
+            let mut ink_count = 0_u32;
+            for output_x in 0..width {
+                if output_x < self.width && self.get(output_x, y) {
+                    ink_count += 1;
+                }
+                if let Some(expired_x) = output_x.checked_sub(diameter) {
+                    if expired_x < self.width && self.get(expired_x, y) {
+                        ink_count -= 1;
+                    }
+                }
+                if ink_count != 0 {
+                    horizontal.set(output_x, y);
+                }
+            }
+        }
+
+        let mut dilated = Self::new(width, height);
+        for x in 0..width {
+            let mut ink_count = 0_u32;
+            for output_y in 0..height {
+                if output_y < self.height && horizontal.get(x, output_y) {
+                    ink_count += 1;
+                }
+                if let Some(expired_y) = output_y.checked_sub(diameter) {
+                    if expired_y < self.height && horizontal.get(x, expired_y) {
+                        ink_count -= 1;
+                    }
+                }
+                if ink_count != 0 {
+                    dilated.set(x, output_y);
+                }
+            }
+        }
+        dilated
+    }
+
+    fn dilated_wordwise(&self, width: u32, height: u32, diameter: u32) -> Self {
+        let mut dilated = Self::new(width, height);
+        let mut expanded_row = vec![0_u64; dilated.stride];
+
+        for source_y in 0..self.height as usize {
+            expanded_row.fill(0);
+            let source_start = source_y * self.stride;
+            for source_word in 0..self.stride {
+                let value = self.rows[source_start + source_word];
+                if value == 0 {
+                    continue;
+                }
+
+                for shift in 0..diameter {
+                    expanded_row[source_word] |= value << shift;
+                    if shift != 0 && source_word + 1 < expanded_row.len() {
+                        expanded_row[source_word + 1] |= value >> (64 - shift);
+                    }
+                }
+            }
+
+            for target_y in source_y..source_y + diameter as usize {
+                let target_start = target_y * dilated.stride;
+                for (target, expanded) in dilated.rows[target_start..target_start + dilated.stride]
+                    .iter_mut()
+                    .zip(&expanded_row)
+                {
+                    *target |= *expanded;
+                }
+            }
+        }
+
+        dilated
     }
 
     pub fn set(&mut self, x: u32, y: u32) {
@@ -295,7 +291,7 @@ mod tests {
     }
 
     fn assert_dilation_matches_oracle(bitmap: &AlphaBitmap, radius: u32) {
-        let actual = bitmap.dilated_bits(radius).unwrap();
+        let actual = bitmap.bits().dilated(radius).unwrap();
         let expected = dilation_oracle(bitmap, radius).unwrap();
         assert_eq!(actual.width, expected.width);
         assert_eq!(actual.height, expected.height);
@@ -373,7 +369,7 @@ mod tests {
             height: 2,
             alpha: vec![0, 0, 0, 0, 255, 0],
         };
-        let expanded = bitmap.dilated_bits(2).unwrap();
+        let expanded = bitmap.bits().dilated(2).unwrap();
         assert_eq!((expanded.width(), expanded.height()), (7, 6));
         for y in 1..=5 {
             for x in 1..=5 {
@@ -416,22 +412,32 @@ mod tests {
     }
 
     #[test]
-    fn sliding_dilation_defers_ink_allocation() {
+    fn bit_grid_rotation_matches_bitmap_rotation() {
         let bitmap = AlphaBitmap {
-            width: 3,
-            height: 2,
-            alpha: vec![0, 255, 0, 255, 0, 255],
+            width: 5,
+            height: 3,
+            alpha: vec![
+                1, 0, 0, 2, 0, //
+                0, 0, 3, 0, 0, //
+                0, 4, 0, 0, 5,
+            ],
         };
 
-        let (fast_ink, _) = bitmap
-            .placement_bits(AlphaBitmap::WORDWISE_DILATION_MAX_RADIUS)
-            .unwrap();
-        let (fallback_ink, _) = bitmap
-            .placement_bits(AlphaBitmap::WORDWISE_DILATION_MAX_RADIUS + 1)
-            .unwrap();
+        let rotated_bits = bitmap.bits().rotate_clockwise();
+        let rotated_alpha_bits = bitmap.rotate_clockwise().bits();
 
-        assert!(fast_ink.is_some());
-        assert!(fallback_ink.is_none());
+        assert_eq!(rotated_bits.width, rotated_alpha_bits.width);
+        assert_eq!(rotated_bits.height, rotated_alpha_bits.height);
+        assert_eq!(rotated_bits.rows, rotated_alpha_bits.rows);
+
+        let quadruple = rotated_bits
+            .rotate_clockwise()
+            .rotate_clockwise()
+            .rotate_clockwise();
+        let original = bitmap.bits();
+        assert_eq!(quadruple.width, original.width);
+        assert_eq!(quadruple.height, original.height);
+        assert_eq!(quadruple.rows, original.rows);
     }
 
     #[test]
@@ -459,8 +465,8 @@ mod tests {
                 0 => 0,
                 1 => 1,
                 2 => 2,
-                3 => AlphaBitmap::WORDWISE_DILATION_MAX_RADIUS,
-                4 => AlphaBitmap::WORDWISE_DILATION_MAX_RADIUS + 1,
+                3 => 8,
+                4 => 9,
                 _ => state as u32 % 17,
             };
 

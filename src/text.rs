@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use fontdue::layout::{CoordinateSystem, GlyphRasterConfig, Layout, LayoutSettings, TextStyle};
 use fontdue::Font;
 
-use crate::bitmap::AlphaBitmap;
+use crate::bitmap::{AlphaBitmap, BitGrid};
 
-const DEFAULT_GLYPH_CACHE_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_GLYPH_CACHE_CAPACITY_BYTES: usize = 256 * 1024;
 const DEFAULT_GLYPH_CACHE_MAX_ENTRIES: usize = 4_096;
 
 pub(crate) fn supports_word(font: &Font, word: &str) -> bool {
@@ -24,6 +24,15 @@ pub(crate) struct TextRasterizer {
     glyph_cache: GlyphRasterCache,
 }
 
+/// The bounding box of a laid-out word, in pixels, relative to the top-left
+/// corner of the box itself.
+struct WordBounds {
+    min_x: i64,
+    min_y: i64,
+    width: u32,
+    height: u32,
+}
+
 impl TextRasterizer {
     pub(crate) fn new() -> Self {
         Self::with_glyph_cache_capacity(DEFAULT_GLYPH_CACHE_CAPACITY_BYTES)
@@ -36,14 +45,17 @@ impl TextRasterizer {
         }
     }
 
-    pub(crate) fn rasterize_word(
+    /// Lays out `word` and returns its pixel bounding box when the word is
+    /// visible and fits the canvas in at least one orientation. This only
+    /// reads glyph metrics; it never rasterizes.
+    fn layout_bounds(
         &mut self,
         font: &Font,
         word: &str,
         font_size: f32,
         canvas_width: u32,
         canvas_height: u32,
-    ) -> Option<AlphaBitmap> {
+    ) -> Option<WordBounds> {
         self.layout.reset(&LayoutSettings::default());
         self.layout
             .append(&[font], &TextStyle::new(word, font_size, 0));
@@ -84,22 +96,36 @@ impl TextRasterizer {
             return None;
         }
 
-        let width_usize = usize::try_from(width).ok()?;
-        let height_usize = usize::try_from(height).ok()?;
-        let mut alpha = vec![0_u8; width_usize.checked_mul(height_usize)?];
+        Some(WordBounds {
+            min_x,
+            min_y,
+            width,
+            height,
+        })
+    }
 
+    /// Calls `visit` with the rasterized coverage and pixel offset of every
+    /// visible glyph of the most recently laid-out word.
+    fn for_each_glyph<R>(
+        &mut self,
+        font: &Font,
+        bounds: &WordBounds,
+        mut visit: impl FnMut(usize, usize, usize, &[u8]) -> Option<R>,
+    ) -> Option<()> {
         for glyph in self
             .layout
             .glyphs()
             .iter()
             .filter(|glyph| glyph.width != 0 && glyph.height != 0)
         {
-            let glyph_x = usize::try_from((glyph.x.floor() as i64).checked_sub(min_x)?).ok()?;
-            let glyph_y = usize::try_from((glyph.y.floor() as i64).checked_sub(min_y)?).ok()?;
+            let glyph_x =
+                usize::try_from((glyph.x.floor() as i64).checked_sub(bounds.min_x)?).ok()?;
+            let glyph_y =
+                usize::try_from((glyph.y.floor() as i64).checked_sub(bounds.min_y)?).ok()?;
             let right = glyph_x.checked_add(glyph.width)?;
             let bottom = glyph_y.checked_add(glyph.height)?;
             let source_len = glyph.width.checked_mul(glyph.height)?;
-            if right > width_usize || bottom > height_usize {
+            if right > bounds.width as usize || bottom > bounds.height as usize {
                 return None;
             }
 
@@ -108,26 +134,66 @@ impl TextRasterizer {
                     if glyph_alpha.len() != source_len {
                         return None;
                     }
-
-                    let source_rows = glyph_alpha.chunks_exact(glyph.width);
-                    let target_rows = alpha
-                        .chunks_exact_mut(width_usize)
-                        .skip(glyph_y)
-                        .take(glyph.height);
-                    for (source_row, target_row) in source_rows.zip(target_rows) {
-                        for (target, source) in
-                            target_row[glyph_x..right].iter_mut().zip(source_row)
-                        {
-                            *target = (*target).max(*source);
-                        }
-                    }
-                    Some(())
+                    visit(glyph_x, glyph_y, glyph.width, glyph_alpha)
                 })?;
         }
+        Some(())
+    }
+
+    /// Returns the ink mask of `word` without materializing its coverage
+    /// bitmap. Bits are set exactly where [`TextRasterizer::rasterize_word`]
+    /// would produce non-zero coverage.
+    pub(crate) fn word_ink(
+        &mut self,
+        font: &Font,
+        word: &str,
+        font_size: f32,
+        canvas_width: u32,
+        canvas_height: u32,
+    ) -> Option<BitGrid> {
+        let bounds = self.layout_bounds(font, word, font_size, canvas_width, canvas_height)?;
+        let mut ink = BitGrid::new(bounds.width, bounds.height);
+        self.for_each_glyph(font, &bounds, |glyph_x, glyph_y, width, glyph_alpha| {
+            for (row, source_row) in glyph_alpha.chunks_exact(width).enumerate() {
+                let y = (glyph_y + row) as u32;
+                for (column, coverage) in source_row.iter().enumerate() {
+                    if *coverage != 0 {
+                        ink.set((glyph_x + column) as u32, y);
+                    }
+                }
+            }
+            Some(())
+        })?;
+        Some(ink)
+    }
+
+    pub(crate) fn rasterize_word(
+        &mut self,
+        font: &Font,
+        word: &str,
+        font_size: f32,
+        canvas_width: u32,
+        canvas_height: u32,
+    ) -> Option<AlphaBitmap> {
+        let bounds = self.layout_bounds(font, word, font_size, canvas_width, canvas_height)?;
+        let width_usize = usize::try_from(bounds.width).ok()?;
+        let mut alpha = vec![0_u8; width_usize.checked_mul(bounds.height as usize)?];
+
+        self.for_each_glyph(font, &bounds, |glyph_x, glyph_y, width, glyph_alpha| {
+            let right = glyph_x + width;
+            let source_rows = glyph_alpha.chunks_exact(width);
+            let target_rows = alpha.chunks_exact_mut(width_usize).skip(glyph_y);
+            for (source_row, target_row) in source_rows.zip(target_rows) {
+                for (target, source) in target_row[glyph_x..right].iter_mut().zip(source_row) {
+                    *target = (*target).max(*source);
+                }
+            }
+            Some(())
+        })?;
 
         Some(AlphaBitmap {
-            width,
-            height,
+            width: bounds.width,
+            height: bounds.height,
             alpha,
         })
     }
@@ -277,6 +343,29 @@ mod tests {
             height,
             alpha,
         })
+    }
+
+    #[test]
+    fn word_ink_matches_rasterized_coverage() {
+        let font = test_font();
+        let mut rasterizer = TextRasterizer::new();
+
+        for (word, font_size) in [("Rust", 61.0), ("glyph", 27.0), ("affinity", 43.0)] {
+            let ink = rasterizer
+                .word_ink(&font, word, font_size, 500, 240)
+                .unwrap();
+            let bitmap = rasterizer
+                .rasterize_word(&font, word, font_size, 500, 240)
+                .unwrap();
+            let expected = bitmap.bits();
+
+            assert_eq!((ink.width(), ink.height()), (bitmap.width, bitmap.height));
+            for y in 0..ink.height() {
+                for x in 0..ink.width() {
+                    assert_eq!(ink.get(x, y), expected.get(x, y));
+                }
+            }
+        }
     }
 
     #[test]

@@ -730,27 +730,29 @@ impl WordCloud {
             let (orientations, orientation_count) = self.orientation_order(&mut layout_rng);
             let mut font_size = target_size.floor().max(self.min_font_size);
             let mut selected = None;
+            let usable_width = self.width - self.margin * 2;
+            let usable_height = self.height - self.margin * 2;
 
+            // Placement is searched with compact ink masks only; the full
+            // coverage bitmap is materialized once a position is selected.
             loop {
-                let usable_width = self.width - self.margin * 2;
-                let usable_height = self.height - self.margin * 2;
-                if let Some(horizontal) = text_rasterizer.rasterize_word(
+                if let Some(horizontal_ink) = text_rasterizer.word_ink(
                     &self.font,
                     &frequency.word,
                     font_size,
                     usable_width,
                     usable_height,
                 ) {
-                    let mut horizontal = Some(horizontal);
+                    let mut horizontal_ink = Some(horizontal_ink);
                     for orientation in orientations[..orientation_count].iter().copied() {
                         match orientation {
                             Orientation::Horizontal => {
-                                let bitmap = horizontal
+                                let ink = horizontal_ink
                                     .as_ref()
-                                    .expect("horizontal bitmap must be available");
-                                if let Some((x, y, ink)) = find_bitmap_position(
+                                    .expect("horizontal ink must be available");
+                                if let Some((x, y)) = find_ink_position(
                                     &occupied,
-                                    bitmap,
+                                    ink,
                                     self.margin,
                                     self.width,
                                     self.height,
@@ -758,10 +760,9 @@ impl WordCloud {
                                     &mut layout_rng,
                                 ) {
                                     selected = Some((
-                                        horizontal
+                                        horizontal_ink
                                             .take()
-                                            .expect("selected horizontal bitmap must be available"),
-                                        ink,
+                                            .expect("selected horizontal ink must be available"),
                                         orientation,
                                         x,
                                         y,
@@ -770,29 +771,29 @@ impl WordCloud {
                                 }
                             }
                             Orientation::Vertical => {
-                                let horizontal_bitmap = horizontal
+                                let ink = horizontal_ink
                                     .as_ref()
-                                    .expect("horizontal bitmap must be available");
+                                    .expect("horizontal ink must be available");
                                 if !bitmap_fits_with_margin(
-                                    horizontal_bitmap.height,
-                                    horizontal_bitmap.width,
+                                    ink.height(),
+                                    ink.width(),
                                     self.margin,
                                     self.width,
                                     self.height,
                                 ) {
                                     continue;
                                 }
-                                let bitmap = horizontal_bitmap.rotate_clockwise();
-                                if let Some((x, y, ink)) = find_bitmap_position(
+                                let ink = ink.rotate_clockwise();
+                                if let Some((x, y)) = find_ink_position(
                                     &occupied,
-                                    &bitmap,
+                                    &ink,
                                     self.margin,
                                     self.width,
                                     self.height,
                                     self.search_attempts,
                                     &mut layout_rng,
                                 ) {
-                                    selected = Some((bitmap, ink, orientation, x, y));
+                                    selected = Some((ink, orientation, x, y));
                                     break;
                                 }
                             }
@@ -805,8 +806,21 @@ impl WordCloud {
                 font_size = next_font_size(font_size, self.font_step, self.min_font_size);
             }
 
-            let Some((bitmap, ink, orientation, x, y)) = selected else {
+            let Some((ink, orientation, x, y)) = selected else {
                 continue;
+            };
+            let Some(horizontal) = text_rasterizer.rasterize_word(
+                &self.font,
+                &frequency.word,
+                font_size,
+                usable_width,
+                usable_height,
+            ) else {
+                continue;
+            };
+            let bitmap = match orientation {
+                Orientation::Horizontal => horizontal,
+                Orientation::Vertical => horizontal.rotate_clockwise(),
             };
             if !occupied.insert(&ink, x, y) {
                 continue;
@@ -991,28 +1005,27 @@ fn bitmap_fits_with_margin(
             .is_some_and(|height| height <= canvas_height)
 }
 
-fn find_bitmap_position(
+fn find_ink_position(
     occupied: &BitGrid,
-    bitmap: &AlphaBitmap,
+    ink: &BitGrid,
     margin: u32,
     canvas_width: u32,
     canvas_height: u32,
     attempts: usize,
     rng: &mut StableRng,
-) -> Option<(u32, u32, BitGrid)> {
+) -> Option<(u32, u32)> {
     if !bitmap_fits_with_margin(
-        bitmap.width,
-        bitmap.height,
+        ink.width(),
+        ink.height(),
         margin,
         canvas_width,
         canvas_height,
     ) {
         return None;
     }
-    let (ink, collision) = bitmap.placement_bits(margin)?;
+    let collision = ink.dilated(margin)?;
     let (collision_x, collision_y) = find_position(occupied, &collision, attempts, rng)?;
-    let ink = ink.unwrap_or_else(|| bitmap.bits());
-    Some((collision_x + margin, collision_y + margin, ink))
+    Some((collision_x + margin, collision_y + margin))
 }
 
 fn find_position(
