@@ -313,6 +313,51 @@ fn invalid_configuration_and_input_return_errors() {
 }
 
 #[test]
+fn repeat_pads_with_downweighted_duplicate_words() {
+    let background = Rgba([255, 255, 255, 255]);
+    let frequencies = [("rust", 100), ("cloud", 10)];
+    let build = |repeat: bool| {
+        WordCloud::builder()
+            .dimensions(480, 280)
+            .max_words(6)
+            .repeat(repeat)
+            .background_color(background)
+            .random_seed(13)
+            .build()
+            .unwrap()
+            .generate_detailed_from_frequencies(frequencies)
+            .unwrap()
+    };
+
+    let plain = build(false);
+    assert!(plain.words().len() <= 2);
+
+    let repeated = build(true);
+    assert!(repeated.words().len() > plain.words().len());
+    // Duplicates of the same word carry strictly decreasing frequencies.
+    let rust_frequencies: Vec<f64> = repeated
+        .words()
+        .iter()
+        .filter(|word| word.word == "rust")
+        .map(|word| word.frequency)
+        .collect();
+    assert!(rust_frequencies.len() >= 2);
+    assert!(rust_frequencies
+        .windows(2)
+        .all(|pair| pair[0] > pair[1]));
+    // Repeated words never render larger than their first occurrence.
+    for word in repeated.words() {
+        let first_font_size = repeated
+            .words()
+            .iter()
+            .find(|other| other.word == word.word)
+            .map(|other| other.font_size)
+            .unwrap();
+        assert!(word.font_size <= first_font_size + f32::EPSILON);
+    }
+}
+
+#[test]
 fn unsupported_words_do_not_consume_max_words_slots() {
     let cloud = WordCloud::builder()
         .dimensions(300, 180)

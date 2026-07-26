@@ -90,6 +90,7 @@ fn main() -> Result<(), wordcloud::WordCloudError> {
 
 - 每个 builder 默认会获得一个新的随机种子；显式固定 `random_seed` 时，同一次构建（依赖版本不变）、配置、字体与输入会产生完全相同的布局和像素。自定义 tokenizer/colorizer 也需要是确定性的，才能维持这一保证。
 - 显式词频输入会合并重复词并绕过 tokenizer、大小写转换与 stopwords。
+- 可用词数不足 `max_words` 时，开启 `repeat(true)` 会把已有词按最小归一化频率逐轮降权重复填充（与 Python `wordcloud` 的 `repeat` 语义一致），重复词的字号会越来越小；默认关闭。
 - 文本入口采用 Unicode word boundary 和英文 stopwords。中文、日文等需要语言分词的文本，建议先用 `jieba-rs` 等工具分词并传词频。
 - 使用 `font_bytes` 可以嵌入应用自己的字体；TTC 字体通过 `font_index` 选择 face。
 - 字形栅格化基于 `ab_glyph`。当前版本适合 Latin、CJK 等无需复杂 shaping 的文本；阿拉伯文、部分印度文字和彩色 emoji 的高级 shaping/彩色字形尚未实现。

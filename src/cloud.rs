@@ -153,6 +153,7 @@ pub struct WordCloudBuilder {
     height: u32,
     scale: u32,
     max_words: usize,
+    repeat: bool,
     min_font_size: f32,
     max_font_size: Option<f32>,
     font_step: f32,
@@ -181,6 +182,7 @@ impl Default for WordCloudBuilder {
             height: DEFAULT_HEIGHT,
             scale: 1,
             max_words: 200,
+            repeat: false,
             min_font_size: 4.0,
             max_font_size: None,
             font_step: 2.0,
@@ -233,6 +235,18 @@ impl WordCloudBuilder {
 
     pub fn max_words(mut self, max_words: usize) -> Self {
         self.max_words = max_words;
+        self
+    }
+
+    /// When fewer than `max_words` words are available, appends the existing
+    /// words again with reduced weights until `max_words` candidates exist.
+    ///
+    /// Each repetition round multiplies the original frequencies by the
+    /// smallest normalized frequency (minimum divided by maximum), matching
+    /// the `repeat` option of the Python `wordcloud` package. Repeated words
+    /// therefore render progressively smaller. Disabled by default.
+    pub fn repeat(mut self, repeat: bool) -> Self {
+        self.repeat = repeat;
         self
     }
 
@@ -531,6 +545,7 @@ impl WordCloudBuilder {
             height,
             scale: self.scale,
             max_words: self.max_words,
+            repeat: self.repeat,
             min_font_size,
             max_font_size,
             font_step,
@@ -560,6 +575,7 @@ pub struct WordCloud {
     height: u32,
     scale: u32,
     max_words: usize,
+    repeat: bool,
     min_font_size: f32,
     max_font_size: f32,
     font_step: f32,
@@ -707,6 +723,11 @@ impl WordCloud {
         if renderable.is_empty() {
             return Err(WordCloudError::NoRenderableWords);
         }
+        let renderable = if self.repeat {
+            extend_with_repeats(renderable, self.max_words)
+        } else {
+            renderable
+        };
 
         let max_frequency = renderable[0].1.frequency;
         let attempted = renderable.len();
@@ -951,6 +972,39 @@ fn scale_font_size(parameter: &'static str, value: f32, scale: u32) -> Result<f3
     }
 }
 
+/// Pads a renderable word list with downweighted copies of itself, mirroring
+/// the `repeat` option of the Python `wordcloud` package. Each repetition
+/// round multiplies the original frequencies by the smallest normalized
+/// frequency (minimum divided by maximum) raised to the round number, so
+/// repeated words render progressively smaller. The result keeps the original
+/// ranks and is truncated to `max_words` entries.
+fn extend_with_repeats(
+    mut renderable: Vec<(usize, WordFrequency)>,
+    max_words: usize,
+) -> Vec<(usize, WordFrequency)> {
+    if renderable.len() >= max_words {
+        return renderable;
+    }
+    let max_frequency = renderable[0].1.frequency;
+    let downweight = renderable[renderable.len() - 1].1.frequency / max_frequency;
+    let originals = renderable.clone();
+    let times_extend = max_words.div_ceil(originals.len()) - 1;
+    for round in 1..=times_extend {
+        let scale = downweight.powi(round as i32);
+        renderable.extend(originals.iter().map(|(rank, frequency)| {
+            (
+                *rank,
+                WordFrequency {
+                    word: frequency.word.clone(),
+                    frequency: frequency.frequency * scale,
+                },
+            )
+        }));
+    }
+    renderable.truncate(max_words);
+    renderable
+}
+
 fn next_font_size(current: f32, step: f32, minimum: f32) -> f32 {
     let next = current - step;
     if !next.is_finite() || next >= current || next < minimum {
@@ -1150,6 +1204,72 @@ mod tests {
         let mut rng = StableRng::new(42);
         assert_eq!(rng.next_u64(), 13_679_457_532_755_275_413);
         assert_eq!(rng.next_u64(), 2_949_826_092_126_892_291);
+    }
+
+    #[test]
+    fn extend_with_repeats_downweights_and_truncates() {
+        let renderable = vec![
+            (
+                0,
+                WordFrequency {
+                    word: "rust".to_owned(),
+                    frequency: 100.0,
+                },
+            ),
+            (
+                1,
+                WordFrequency {
+                    word: "cloud".to_owned(),
+                    frequency: 10.0,
+                },
+            ),
+        ];
+        // ceil(5 / 2) - 1 = 2 extra rounds; downweight = 10 / 100 = 0.1.
+        let extended = extend_with_repeats(renderable, 5);
+        let keys: Vec<_> = extended
+            .iter()
+            .map(|(rank, frequency)| (*rank, frequency.word.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (0, "rust"),
+                (1, "cloud"),
+                (0, "rust"),
+                (1, "cloud"),
+                (0, "rust"),
+            ]
+        );
+        let frequencies: Vec<f64> = extended
+            .iter()
+            .map(|(_, frequency)| frequency.frequency)
+            .collect();
+        let expected = [100.0, 10.0, 10.0, 1.0, 1.0];
+        for (actual, expected) in frequencies.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn extend_with_repeats_is_noop_when_max_words_is_reached() {
+        let renderable = vec![
+            (
+                0,
+                WordFrequency {
+                    word: "rust".to_owned(),
+                    frequency: 2.0,
+                },
+            ),
+            (
+                1,
+                WordFrequency {
+                    word: "cloud".to_owned(),
+                    frequency: 1.0,
+                },
+            ),
+        ];
+        assert_eq!(extend_with_repeats(renderable.clone(), 2), renderable);
+        assert_eq!(extend_with_repeats(renderable.clone(), 1), renderable);
     }
 
     #[test]
