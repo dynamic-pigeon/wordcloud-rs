@@ -1,5 +1,6 @@
 use image::{DynamicImage, GrayImage};
 
+use crate::bitmap::BitGrid;
 use crate::{Result, WordCloudError};
 
 const MAX_MASK_PIXELS: u64 = 16_000_000;
@@ -13,12 +14,13 @@ pub enum MaskPolarity {
     LightAllowed,
 }
 
-/// A shape restricting where word pixels may be placed.
+/// A shape restricting where word pixels may be placed. Pixels are stored as
+/// a bit grid, one bit per pixel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mask {
     width: u32,
     height: u32,
-    allowed: Vec<bool>,
+    allowed: BitGrid,
 }
 
 impl Mask {
@@ -38,13 +40,16 @@ impl Mask {
         polarity: MaskPolarity,
     ) -> Self {
         let (width, height) = image.dimensions();
-        let allowed = image
-            .pixels()
-            .map(|pixel| match polarity {
+        let mut allowed = BitGrid::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels() {
+            let is_allowed = match polarity {
                 MaskPolarity::LightBlocked => pixel[0] < threshold,
                 MaskPolarity::LightAllowed => pixel[0] >= threshold,
-            })
-            .collect();
+            };
+            if is_allowed {
+                allowed.set(x, y);
+            }
+        }
         Self {
             width,
             height,
@@ -67,15 +72,12 @@ impl Mask {
         if pixels > MAX_MASK_PIXELS {
             return Err(WordCloudError::CanvasTooLarge { width, height });
         }
-        let capacity = usize::try_from(pixels)
-            .map_err(|_| WordCloudError::CanvasTooLarge { width, height })?;
-        let mut allowed = Vec::new();
-        allowed
-            .try_reserve_exact(capacity)
-            .map_err(|_| WordCloudError::CanvasTooLarge { width, height })?;
+        let mut allowed = BitGrid::new(width, height);
         for y in 0..height {
             for x in 0..width {
-                allowed.push(is_allowed(x, y));
+                if is_allowed(x, y) {
+                    allowed.set(x, y);
+                }
             }
         }
         Ok(Self {
@@ -101,10 +103,10 @@ impl Mask {
         if x >= self.width || y >= self.height {
             return false;
         }
-        self.allowed[(y as usize) * (self.width as usize) + (x as usize)]
+        self.allowed.get(x, y)
     }
 
-    pub(crate) fn allowed_pixels(&self) -> &[bool] {
+    pub(crate) fn allowed_grid(&self) -> &BitGrid {
         &self.allowed
     }
 }

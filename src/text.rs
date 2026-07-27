@@ -6,6 +6,7 @@ use crate::bitmap::{AlphaBitmap, BitGrid};
 
 const DEFAULT_GLYPH_CACHE_CAPACITY_BYTES: usize = 256 * 1024;
 const DEFAULT_GLYPH_CACHE_MAX_ENTRIES: usize = 4_096;
+const BOUNDS_CACHE_MAX_ENTRIES: usize = 8_192;
 
 pub(crate) fn supports_word(font: &FontArc, word: &str) -> bool {
     let mut visible = false;
@@ -43,8 +44,20 @@ struct CachedGlyph {
     coverage: Vec<u8>,
 }
 
+/// The float pixel bounds of a glyph positioned at the origin. Bounds at any
+/// baseline position are derived by translating `min_x`/`max_x`, which is the
+/// same floating-point arithmetic the outline would report there.
+#[derive(Clone, Copy)]
+struct CachedBounds {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+}
+
 pub(crate) struct TextRasterizer {
     glyph_cache: GlyphRasterCache,
+    bounds_cache: HashMap<(GlyphId, u32), Option<CachedBounds>>,
 }
 
 impl TextRasterizer {
@@ -55,6 +68,7 @@ impl TextRasterizer {
     fn with_glyph_cache_capacity(capacity_bytes: usize) -> Self {
         Self {
             glyph_cache: GlyphRasterCache::new(capacity_bytes),
+            bounds_cache: HashMap::new(),
         }
     }
 
@@ -80,35 +94,57 @@ impl TextRasterizer {
     }
 
     /// Returns the pixel bounds of a laid-out glyph as `(min_x, min_y, width,
-    /// height)`, or `None` when the glyph has no visible outline.
+    /// height)`, or `None` when the glyph has no visible outline. The raw
+    /// outline bounds are cached per (glyph, size) so the font-size retry
+    /// loop does not re-extract outlines that only moved horizontally.
     fn glyph_pixel_bounds(
+        &mut self,
         font: &FontArc,
         glyph: &PositionedGlyph,
         font_size: f32,
     ) -> Option<(i64, i64, u32, u32)> {
-        let outlined = font.outline_glyph(Glyph {
-            id: glyph.id,
-            scale: PxScale::from(font_size),
-            position: point(glyph.x, 0.0),
-        })?;
-        let bounds = outlined.px_bounds();
-        let width = bounds.width() as u32;
-        let height = bounds.height() as u32;
+        let key = (glyph.id, font_size.to_bits());
+        let cached = if let Some(cached) = self.bounds_cache.get(&key) {
+            *cached
+        } else {
+            let bounds = font
+                .outline_glyph(Glyph {
+                    id: glyph.id,
+                    scale: PxScale::from(font_size),
+                    position: point(0.0, 0.0),
+                })
+                .map(|outlined| {
+                    let bounds = outlined.px_bounds();
+                    CachedBounds {
+                        min_x: bounds.min.x,
+                        min_y: bounds.min.y,
+                        max_x: bounds.max.x,
+                        max_y: bounds.max.y,
+                    }
+                });
+            if self.bounds_cache.len() >= BOUNDS_CACHE_MAX_ENTRIES {
+                self.bounds_cache.clear();
+            }
+            self.bounds_cache.insert(key, bounds);
+            bounds
+        };
+        let bounds = cached?;
+        let min_x = bounds.min_x + glyph.x;
+        let max_x = bounds.max_x + glyph.x;
+        let width = (max_x - min_x) as u32;
+        let height = (bounds.max_y - bounds.min_y) as u32;
         if width == 0 || height == 0 {
             return None;
         }
-        Some((
-            bounds.min.x.floor() as i64,
-            bounds.min.y.floor() as i64,
-            width,
-            height,
-        ))
+        Some((min_x.floor() as i64, bounds.min_y.floor() as i64, width, height))
     }
 
     /// Computes the pixel bounding box of a word, returning `None` when the
     /// word has no visible glyphs or does not fit the canvas in at least one
-    /// orientation. This only reads glyph outlines; it never rasterizes.
+    /// orientation. This only reads (cached) glyph outline bounds; it never
+    /// rasterizes.
     fn word_bounds(
+        &mut self,
         font: &FontArc,
         glyphs: &[PositionedGlyph],
         font_size: f32,
@@ -122,7 +158,7 @@ impl TextRasterizer {
         let mut has_visible_glyph = false;
         for glyph in glyphs {
             let Some((glyph_x, glyph_y, width, height)) =
-                Self::glyph_pixel_bounds(font, glyph, font_size)
+                self.glyph_pixel_bounds(font, glyph, font_size)
             else {
                 continue;
             };
@@ -166,7 +202,7 @@ impl TextRasterizer {
         canvas_height: u32,
     ) -> Option<BitGrid> {
         let glyphs = Self::layout_word(font, word, font_size);
-        let bounds = Self::word_bounds(font, &glyphs, font_size, canvas_width, canvas_height)?;
+        let bounds = self.word_bounds(font, &glyphs, font_size, canvas_width, canvas_height)?;
         let mut ink = BitGrid::new(bounds.width, bounds.height);
         for positioned in &glyphs {
             self.glyph_cache
@@ -198,7 +234,7 @@ impl TextRasterizer {
         canvas_height: u32,
     ) -> Option<AlphaBitmap> {
         let glyphs = Self::layout_word(font, word, font_size);
-        let bounds = Self::word_bounds(font, &glyphs, font_size, canvas_width, canvas_height)?;
+        let bounds = self.word_bounds(font, &glyphs, font_size, canvas_width, canvas_height)?;
         let width_usize = usize::try_from(bounds.width).ok()?;
         let mut alpha = vec![0_u8; width_usize.checked_mul(bounds.height as usize)?];
 

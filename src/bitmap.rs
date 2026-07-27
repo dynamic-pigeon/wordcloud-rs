@@ -38,7 +38,7 @@ impl AlphaBitmap {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BitGrid {
     width: u32,
     height: u32,

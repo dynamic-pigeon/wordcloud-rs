@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,7 +11,7 @@ use image::{ColorType, DynamicImage, ImageFormat, Pixel, Rgb, RgbImage, Rgba, Rg
 
 use crate::bitmap::{AlphaBitmap, BitGrid};
 use crate::color::{ColorContext, Colorizer, Palette, SolidColor};
-use crate::frequency::{collect_frequencies, IntoWordFrequency, WordFrequency};
+use crate::frequency::{collect_frequencies, sort_frequencies, IntoWordFrequency, WordFrequency};
 use crate::mask::Mask;
 use crate::text::{supports_word, TextRasterizer};
 use crate::tokenizer::{DefaultTokenizer, StopWords, Tokenizer};
@@ -618,40 +619,71 @@ impl WordCloud {
     }
 
     pub fn word_frequencies(&self, text: &str) -> Result<Vec<WordFrequency>> {
-        let mut counts = BTreeMap::<String, u64>::new();
-        for candidate in self.tokenizer.tokenize(text) {
+        let mut counts = HashMap::<String, u64>::new();
+        let mut invalid = None;
+        self.tokenizer.for_each_token(text, &mut |candidate| {
+            if invalid.is_some() {
+                return;
+            }
             let candidate = candidate.trim();
             if candidate.is_empty() {
-                continue;
+                return;
             }
-            let word = if self.lowercase {
-                candidate.to_lowercase()
+            let word: Cow<'_, str> = if self.lowercase {
+                Cow::Owned(candidate.to_lowercase())
             } else {
-                candidate.to_owned()
+                Cow::Borrowed(candidate)
             };
             let word_length = word.chars().count();
             if word_length > self.max_word_length {
-                return Err(WordCloudError::InvalidWord {
-                    word,
+                invalid = Some(WordCloudError::InvalidWord {
+                    word: word.into_owned(),
                     reason: format!("exceeds max_word_length ({})", self.max_word_length),
                 });
+                return;
             }
             if word_length < self.min_word_length
-                || self.stopwords.contains(&word)
+                || self.is_stopword(&word)
                 || (!self.include_numbers
                     && word
                         .chars()
                         .filter(|character| !character.is_whitespace())
                         .all(|character| character.is_numeric()))
             {
-                continue;
+                return;
             }
-            *counts.entry(word).or_default() += 1;
+            // Only first-time words allocate a key; repeats borrow.
+            if let Some(count) = counts.get_mut(word.as_ref()) {
+                *count += 1;
+            } else {
+                counts.insert(word.into_owned(), 1);
+            }
+        });
+        if let Some(error) = invalid {
+            return Err(error);
         }
-        collect_frequencies(counts.into_iter().map(|(word, frequency)| WordFrequency {
-            word,
-            frequency: frequency as f64,
-        }))
+        if counts.is_empty() {
+            return Err(WordCloudError::EmptyInput);
+        }
+        let mut words: Vec<_> = counts
+            .into_iter()
+            .map(|(word, count)| WordFrequency {
+                word,
+                frequency: count as f64,
+            })
+            .collect();
+        sort_frequencies(&mut words);
+        Ok(words)
+    }
+
+    /// Checks the stop-word list without re-lowercasing words that the
+    /// tokenizer path already lowercased.
+    fn is_stopword(&self, word: &str) -> bool {
+        if self.lowercase {
+            self.stopwords.contains_lowercased(word)
+        } else {
+            self.stopwords.contains(word)
+        }
     }
 
     pub fn generate(&self, text: &str) -> Result<RgbaImage> {
@@ -1020,8 +1052,7 @@ fn build_mask_occupancy(mask: &Mask, width: u32, height: u32, scale: u32) -> Bit
     let mut occupied = BitGrid::new(width, height);
     for mask_y in 0..mask.height() {
         for mask_x in 0..mask.width() {
-            if mask.allowed_pixels()[(mask_y as usize) * (mask.width() as usize) + mask_x as usize]
-            {
+            if mask.allowed_grid().get(mask_x, mask_y) {
                 continue;
             }
             let start_x = mask_x * scale;

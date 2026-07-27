@@ -5,6 +5,15 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Converts natural text into candidate words.
 pub trait Tokenizer: Send + Sync {
     fn tokenize(&self, text: &str) -> Vec<String>;
+
+    /// Streams each token into `visit` without materializing a vector. The
+    /// default implementation falls back to [`Tokenizer::tokenize`];
+    /// tokenizers that can borrow from the input should override it.
+    fn for_each_token(&self, text: &str, visit: &mut dyn FnMut(&str)) {
+        for token in self.tokenize(text) {
+            visit(&token);
+        }
+    }
 }
 
 impl<F> Tokenizer for F
@@ -23,6 +32,12 @@ pub struct DefaultTokenizer;
 impl Tokenizer for DefaultTokenizer {
     fn tokenize(&self, text: &str) -> Vec<String> {
         text.unicode_words().map(str::to_owned).collect()
+    }
+
+    fn for_each_token(&self, text: &str, visit: &mut dyn FnMut(&str)) {
+        for word in text.unicode_words() {
+            visit(word);
+        }
     }
 }
 
@@ -64,6 +79,12 @@ impl StopWords {
 
     pub fn contains(&self, word: &str) -> bool {
         self.words.contains(&word.to_lowercase())
+    }
+
+    /// Looks up a word that is already lowercased, avoiding a second
+    /// lowercase allocation on the caller side.
+    pub(crate) fn contains_lowercased(&self, word: &str) -> bool {
+        self.words.contains(word)
     }
 
     pub fn clear(&mut self) {

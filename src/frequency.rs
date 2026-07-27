@@ -1,4 +1,4 @@
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::{Result, WordCloudError};
 
@@ -75,7 +75,7 @@ where
     I: IntoIterator<Item = T>,
     T: IntoWordFrequency,
 {
-    let mut merged = BTreeMap::<String, f64>::new();
+    let mut merged = HashMap::<String, f64>::new();
 
     for item in input {
         let WordFrequency { word, frequency } = item.into_word_frequency();
@@ -115,11 +115,17 @@ where
         .into_iter()
         .map(|(word, frequency)| WordFrequency { word, frequency })
         .collect();
+    sort_frequencies(&mut words);
+    Ok(words)
+}
+
+/// Orders words by descending frequency with a word tie-break, so the result
+/// is fully deterministic regardless of the collection order upstream.
+pub(crate) fn sort_frequencies(words: &mut [WordFrequency]) {
     words.sort_by(|left, right| {
         right
             .frequency
             .total_cmp(&left.frequency)
             .then_with(|| left.word.cmp(&right.word))
     });
-    Ok(words)
 }
