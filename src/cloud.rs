@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ab_glyph::{FontArc, FontVec};
+use ab_glyph::{CodepointIdIter, Font, FontArc, FontRef, FontVec, GlyphId, InvalidFont, Outline};
 use image::{ColorType, DynamicImage, ImageFormat, Pixel, Rgb, RgbImage, Rgba, RgbaImage};
 
 use crate::bitmap::{AlphaBitmap, BitGrid};
@@ -940,23 +940,118 @@ impl WordCloud {
     }
 }
 
+/// A [`Font`] that borrows its bytes from an [`Arc<[u8]>`] it keeps alive,
+/// avoiding the copy that [`FontVec`] would require.
+///
+/// # Soundness
+///
+/// `font` borrows the bytes owned by `data` with its lifetime extended to
+/// `'static`. This is sound because:
+/// - `data` is owned by this struct and is only dropped when the struct is
+///   dropped, at which point `font` can no longer be reached through the
+///   `Font` trait object;
+/// - `Arc<[u8]>` is immutable (`Arc::get_mut` returns `None` while this struct
+///   holds a reference), so the borrowed bytes can never be mutated or moved;
+/// - [`FontRef`] has no `Drop` impl and no interior mutability, so the
+///   self-referential layout is safe to move.
+struct ArcBorrowedFont {
+    // Kept alive for `font`'s borrow below.
+    _data: Arc<[u8]>,
+    font: FontRef<'static>,
+}
+
+impl ArcBorrowedFont {
+    fn try_from_bytes(data: Arc<[u8]>, index: u32) -> std::result::Result<Self, InvalidFont> {
+        // SAFETY: `font` borrows the bytes owned by `data`. `data` is moved
+        // into the returned struct, so it stays alive for as long as the
+        // struct does. See the struct-level soundness note.
+        let font = unsafe {
+            let static_bytes: &'static [u8] = &*(&*data as *const [u8]);
+            FontRef::try_from_slice_and_index(static_bytes, index)?
+        };
+        Ok(Self { _data: data, font })
+    }
+}
+
+impl Font for ArcBorrowedFont {
+    fn units_per_em(&self) -> Option<f32> {
+        self.font.units_per_em()
+    }
+    fn ascent_unscaled(&self) -> f32 {
+        self.font.ascent_unscaled()
+    }
+    fn descent_unscaled(&self) -> f32 {
+        self.font.descent_unscaled()
+    }
+    fn line_gap_unscaled(&self) -> f32 {
+        self.font.line_gap_unscaled()
+    }
+    fn italic_angle(&self) -> f32 {
+        self.font.italic_angle()
+    }
+    fn glyph_id(&self, c: char) -> GlyphId {
+        self.font.glyph_id(c)
+    }
+    fn h_advance_unscaled(&self, id: GlyphId) -> f32 {
+        self.font.h_advance_unscaled(id)
+    }
+    fn h_side_bearing_unscaled(&self, id: GlyphId) -> f32 {
+        self.font.h_side_bearing_unscaled(id)
+    }
+    fn v_advance_unscaled(&self, id: GlyphId) -> f32 {
+        self.font.v_advance_unscaled(id)
+    }
+    fn v_side_bearing_unscaled(&self, id: GlyphId) -> f32 {
+        self.font.v_side_bearing_unscaled(id)
+    }
+    fn kern_unscaled(&self, first: GlyphId, second: GlyphId) -> f32 {
+        self.font.kern_unscaled(first, second)
+    }
+    fn outline(&self, id: GlyphId) -> Option<Outline> {
+        self.font.outline(id)
+    }
+    fn glyph_count(&self) -> usize {
+        self.font.glyph_count()
+    }
+    fn codepoint_ids(&self) -> CodepointIdIter<'_> {
+        self.font.codepoint_ids()
+    }
+    fn glyph_raster_image2(&self, id: GlyphId, pixel_size: u16) -> Option<ab_glyph::v2::GlyphImage<'_>> {
+        self.font.glyph_raster_image2(id, pixel_size)
+    }
+}
+
 fn load_font(source: &FontSource) -> Result<FontArc> {
-    let (bytes, index): (Vec<u8>, u32) = match source {
-        FontSource::Embedded { index } => (DEFAULT_FONT.to_vec(), *index),
+    let font: FontArc = match source {
+        // `DEFAULT_FONT` is a `'static` slice baked into the binary, so
+        // `FontRef` borrows it directly instead of copying it into a `Vec`.
+        FontSource::Embedded { index } => FontRef::try_from_slice_and_index(DEFAULT_FONT, *index)
+            .map(FontArc::new)
+            .map_err(|reason| WordCloudError::InvalidFont {
+                reason: reason.to_string(),
+            })?,
+        // `fs::read` already produces an owned buffer; `FontVec` takes it
+        // without an additional copy.
         FontSource::Path { path, index } => {
             let bytes = fs::read(path).map_err(|source| WordCloudError::FontRead {
                 path: path.clone(),
                 source,
             })?;
-            (bytes, *index)
+            FontVec::try_from_vec_and_index(bytes, *index)
+                .map(FontArc::new)
+                .map_err(|reason| WordCloudError::InvalidFont {
+                    reason: reason.to_string(),
+                })?
         }
-        FontSource::Bytes { data, index } => (data.to_vec(), *index),
+        // `clone()` only bumps the `Arc` refcount: the font bytes are shared
+        // with the `FontSource` (and the caller), never copied.
+        FontSource::Bytes { data, index } => ArcBorrowedFont::try_from_bytes(data.clone(), *index)
+            .map(FontArc::new)
+            .map_err(|reason| WordCloudError::InvalidFont {
+                reason: reason.to_string(),
+            })?,
     };
-    FontVec::try_from_vec_and_index(bytes, index)
-        .map(FontArc::new)
-        .map_err(|reason| WordCloudError::InvalidFont {
-            reason: reason.to_string(),
-        })
+    Ok(font)
 }
 
 fn validate_positive_u32(parameter: &'static str, value: u32) -> Result<()> {
@@ -1470,5 +1565,57 @@ mod tests {
             assert!(!occupied.collides(&bits, word.x, word.y));
             assert!(occupied.insert(&bits, word.x, word.y));
         }
+    }
+
+    #[test]
+    fn font_data_borrows_the_arc_without_copying() {
+        let arc: Arc<[u8]> = Arc::from(DEFAULT_FONT);
+        let cloud = WordCloud::builder()
+            .font_data(arc.clone())
+            .random_seed(91)
+            .build()
+            .unwrap();
+        // `build()` consumes the builder, so `font_source` is dropped here.
+        // The generated font still shares the caller's allocation (caller +
+        // `ArcBorrowedFont` = 2). A copy-based path would leave only the
+        // caller's ref (1), because the copied `Vec` lives separately.
+        assert_eq!(Arc::strong_count(&arc), 2);
+        // Dropping the caller's reference must not invalidate the generated
+        // font: the guard keeps the shared bytes alive.
+        drop(arc);
+        let rendered = cloud
+            .generate_detailed_from_frequencies([("rust", 30), ("cloud", 20)])
+            .unwrap();
+        assert!(!rendered.words().is_empty());
+    }
+
+    #[test]
+    fn embedded_and_borrowed_fonts_render_identically() {
+        let embedded = WordCloud::builder().random_seed(91).build().unwrap();
+        let borrowed = WordCloud::builder()
+            .font_data(Arc::<[u8]>::from(DEFAULT_FONT))
+            .random_seed(91)
+            .build()
+            .unwrap();
+        let frequencies = [
+            ("rust", 30),
+            ("safety", 24),
+            ("performance", 20),
+            ("ownership", 17),
+            ("borrowing", 15),
+            ("concurrency", 13),
+            ("reliable", 11),
+            ("productive", 9),
+            ("tooling", 7),
+            ("systems", 5),
+        ];
+        let a = embedded
+            .generate_detailed_from_frequencies(frequencies)
+            .unwrap();
+        let b = borrowed
+            .generate_detailed_from_frequencies(frequencies)
+            .unwrap();
+        assert_eq!(a.words(), b.words());
+        assert_eq!(a.image().as_raw(), b.image().as_raw());
     }
 }
