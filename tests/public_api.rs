@@ -157,6 +157,41 @@ fn seed_changes_layout_but_palette_does_not() {
 }
 
 #[test]
+fn default_generation_uses_a_fresh_layout_seed() {
+    let frequencies = [
+        ("rust", 12),
+        ("safety", 11),
+        ("cloud", 10),
+        ("layout", 9),
+        ("image", 8),
+        ("color", 7),
+        ("font", 6),
+        ("data", 5),
+    ];
+    let cloud = WordCloud::builder()
+        .dimensions(420, 240)
+        .prefer_horizontal(0.5)
+        .build()
+        .unwrap();
+
+    let first = cloud
+        .generate_detailed_from_frequencies(frequencies)
+        .unwrap();
+    let second = cloud
+        .generate_detailed_from_frequencies(frequencies)
+        .unwrap();
+    let geometry = |rendered: &wordcloud::RenderedWordCloud| {
+        rendered
+            .words()
+            .iter()
+            .map(|word| (word.word.clone(), word.x, word.y, word.orientation))
+            .collect::<Vec<_>>()
+    };
+
+    assert_ne!(geometry(&first), geometry(&second));
+}
+
+#[test]
 fn mask_controls_dimensions_and_blocks_output_pixels() {
     let background = Rgba([255, 255, 255, 255]);
     let mask = Mask::from_predicate(320, 240, |x, y| {

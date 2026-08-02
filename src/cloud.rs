@@ -161,7 +161,7 @@ pub struct WordCloudBuilder {
     margin: u32,
     prefer_horizontal: f32,
     relative_scaling: f32,
-    random_seed: u64,
+    random_seed: Option<u64>,
     background_color: Rgba<u8>,
     font_source: FontSource,
     mask: Option<Mask>,
@@ -190,7 +190,7 @@ impl Default for WordCloudBuilder {
             margin: 2,
             prefer_horizontal: 0.9,
             relative_scaling: 0.5,
-            random_seed: default_random_seed(),
+            random_seed: None,
             background_color: Rgba([255, 255, 255, 255]),
             font_source: FontSource::default(),
             mask: None,
@@ -286,9 +286,17 @@ impl WordCloudBuilder {
         self
     }
 
-    /// Uses a fixed seed instead of the fresh seed assigned when the builder is created.
+    /// Uses a fixed seed, making repeated generations with the same input reproducible.
+    ///
+    /// Without this option, every generation uses a fresh seed.
     pub fn random_seed(mut self, seed: u64) -> Self {
-        self.random_seed = seed;
+        self.random_seed = Some(seed);
+        self
+    }
+
+    /// Restores the default behavior of using a fresh seed for every generation.
+    pub fn randomize_each_generation(mut self) -> Self {
+        self.random_seed = None;
         self
     }
 
@@ -583,7 +591,7 @@ pub struct WordCloud {
     margin: u32,
     prefer_horizontal: f32,
     relative_scaling: f32,
-    random_seed: u64,
+    random_seed: Option<u64>,
     background_color: Rgba<u8>,
     font: FontArc,
     mask_occupancy: Option<BitGrid>,
@@ -765,8 +773,9 @@ impl WordCloud {
         let attempted = renderable.len();
         let mut occupied = self.initial_occupancy();
         let mut text_rasterizer = TextRasterizer::new();
-        let mut layout_rng = StableRng::new(self.random_seed ^ 0x4c41_594f_5554_5f31);
-        let mut color_rng = StableRng::new(self.random_seed ^ 0x434f_4c4f_5253_5f31);
+        let random_seed = self.random_seed.unwrap_or_else(default_random_seed);
+        let mut layout_rng = StableRng::new(random_seed ^ 0x4c41_594f_5554_5f31);
+        let mut color_rng = StableRng::new(random_seed ^ 0x434f_4c4f_5253_5f31);
         let mut placed = Vec::<PlacedWord>::new();
         let mut image = None;
         let mut previous: Option<(f64, f32)> = None;
@@ -1211,11 +1220,8 @@ fn find_position(
 ) -> Option<(u32, u32)> {
     let max_x = occupied.width().checked_sub(candidate.width())?;
     let max_y = occupied.height().checked_sub(candidate.height())?;
-    let center = (max_x / 2, max_y / 2);
-    if position_is_free(occupied, candidate, center.0, center.1) {
-        return Some(center);
-    }
-
+    // Try a center-biased random position first. This lets the dominant word
+    // move between generations while keeping the composition near the middle.
     let biased_attempts = attempts.min(96);
     for _ in 0..biased_attempts {
         let x = ((u64::from(rng.range_inclusive(max_x)) + u64::from(rng.range_inclusive(max_x)))
@@ -1225,6 +1231,13 @@ fn find_position(
         if position_is_free(occupied, candidate, x, y) {
             return Some((x, y));
         }
+    }
+
+    // The exact center remains a reliable fallback for sparse random misses
+    // and restrictive masks.
+    let center = (max_x / 2, max_y / 2);
+    if position_is_free(occupied, candidate, center.0, center.1) {
+        return Some(center);
     }
 
     let positions_per_row = u64::from(max_x) + 1;
@@ -1333,6 +1346,22 @@ mod tests {
     }
 
     #[test]
+    fn empty_canvas_placement_is_randomized_around_center() {
+        let occupied = BitGrid::new(400, 200);
+        let candidate = BitGrid::new(100, 40);
+        let center = (150, 80);
+        let mut first_rng = StableRng::new(1);
+        let mut second_rng = StableRng::new(2);
+
+        let first = find_position(&occupied, &candidate, 1, &mut first_rng).unwrap();
+        let second = find_position(&occupied, &candidate, 1, &mut second_rng).unwrap();
+
+        assert_ne!(first, center);
+        assert_ne!(second, center);
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn extend_with_repeats_downweights_and_truncates() {
         let renderable = vec![
             (
@@ -1399,11 +1428,16 @@ mod tests {
     }
 
     #[test]
-    fn builders_receive_distinct_default_seeds() {
-        let first = WordCloudBuilder::new().random_seed;
-        let second = WordCloudBuilder::new().random_seed;
-        assert_ne!(first, second);
-        assert_eq!(WordCloudBuilder::new().random_seed(0).random_seed, 0);
+    fn builder_seed_mode_can_be_selected() {
+        assert_eq!(WordCloudBuilder::new().random_seed, None);
+        assert_eq!(WordCloudBuilder::new().random_seed(0).random_seed, Some(0));
+        assert_eq!(
+            WordCloudBuilder::new()
+                .random_seed(42)
+                .randomize_each_generation()
+                .random_seed,
+            None
+        );
     }
 
     #[test]

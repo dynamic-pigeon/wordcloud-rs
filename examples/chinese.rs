@@ -35,7 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_font_size(120.0)
         .prefer_horizontal(0.86)
         .background_color(Rgba([250, 250, 248, 255]))
-        .random_seed(42)
         .build()?;
     cloud.save_from_frequencies(frequencies, "wordcloud-zh.png")?;
     println!("saved wordcloud-zh.png");

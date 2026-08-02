@@ -24,7 +24,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_words(100)
         .max_font_size(96.0)
         .background_color(Rgba([248, 248, 246, 255]))
-        .random_seed(42)
         .build()?;
 
     cloud.save(
@@ -45,7 +44,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .dimensions(900, 520)
         .font_path("/path/to/NotoSansCJK-Regular.ttc")
         .font_index(0)
-        .random_seed(7)
         .build()?;
 
     cloud.save_from_frequencies(
@@ -88,7 +86,7 @@ fn main() -> Result<(), wordcloud::WordCloudError> {
 
 ## 行为说明
 
-- 每个 builder 默认会获得一个新的随机种子；显式固定 `random_seed` 时，同一次构建（依赖版本不变）、配置、字体与输入会产生完全相同的布局和像素。自定义 tokenizer/colorizer 也需要是确定性的，才能维持这一保证。
+- 默认每次生成都会使用新的随机种子，最大词也会在画布中心附近随机起步，因此复用同一个 `WordCloud` 生成相同输入仍会得到不同布局。需要可复现结果时可显式设置 `random_seed`；此时在依赖版本、配置、字体与输入相同的前提下，布局和像素完全相同。调用 `randomize_each_generation()` 可以恢复默认随机模式。自定义 tokenizer/colorizer 也需要是确定性的，才能维持固定 seed 的保证。
 - 显式词频输入会合并重复词并绕过 tokenizer、大小写转换与 stopwords。
 - 可用词数不足 `max_words` 时，开启 `repeat(true)` 会把已有词按最小归一化频率逐轮降权重复填充（与 Python `wordcloud` 的 `repeat` 语义一致），重复词的字号会越来越小；默认关闭。
 - 文本入口采用 Unicode word boundary 和英文 stopwords。中文、日文等需要语言分词的文本，建议先用 `jieba-rs` 等工具分词并传词频。

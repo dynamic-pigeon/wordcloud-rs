@@ -1,4 +1,4 @@
-//! Deterministic word-cloud generation for Rust.
+//! Random or reproducible word-cloud generation for Rust.
 //!
 //! [`WordCloud`] can generate an image either from natural text or from explicit
 //! word frequencies. The latter is useful for languages that need an external
@@ -10,7 +10,6 @@
 //! let cloud = WordCloud::builder()
 //!     .dimensions(800, 500)
 //!     .background_color(Rgba([248, 248, 246, 255]))
-//!     .random_seed(42)
 //!     .build()?;
 //!
 //! cloud.save(

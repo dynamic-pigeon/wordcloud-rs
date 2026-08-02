@@ -23,7 +23,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Rgba([180, 57, 62, 255]),
             Rgba([92, 72, 125, 255]),
         ])
-        .random_seed(2026)
         .build()?;
 
     let rendered = cloud.generate_detailed(text)?;
