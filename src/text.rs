@@ -77,7 +77,9 @@ impl TextRasterizer {
     fn layout_word(font: &FontArc, word: &str, font_size: f32) -> Vec<PositionedGlyph> {
         let scaled = font.as_scaled(PxScale::from(font_size));
         let mut x = 0.0_f32;
-        let mut glyphs = Vec::with_capacity(word.len());
+        // Pre-size by scalar count, not byte length: CJK characters are three
+        // bytes each and would otherwise over-allocate the layout vector.
+        let mut glyphs = Vec::with_capacity(word.chars().count());
         for character in word.chars() {
             if character.is_control() {
                 continue;
@@ -136,7 +138,12 @@ impl TextRasterizer {
         if width == 0 || height == 0 {
             return None;
         }
-        Some((min_x.floor() as i64, bounds.min_y.floor() as i64, width, height))
+        Some((
+            min_x.floor() as i64,
+            bounds.min_y.floor() as i64,
+            width,
+            height,
+        ))
     }
 
     /// Computes the pixel bounding box of a word, returning `None` when the
@@ -215,7 +222,9 @@ impl TextRasterizer {
                             if glyph.coverage[(row * glyph.width + column) as usize] != 0 {
                                 let x = base_x + i64::from(column);
                                 debug_assert!(x >= 0 && y >= 0);
-                                debug_assert!(x < i64::from(bounds.width) && y < i64::from(bounds.height));
+                                debug_assert!(
+                                    x < i64::from(bounds.width) && y < i64::from(bounds.height)
+                                );
                                 ink.set(x as u32, y as u32);
                             }
                         }
@@ -233,10 +242,42 @@ impl TextRasterizer {
         canvas_width: u32,
         canvas_height: u32,
     ) -> Option<AlphaBitmap> {
+        self.rasterize_word_impl(font, word, font_size, canvas_width, canvas_height, false)
+    }
+
+    /// Like [`TextRasterizer::rasterize_word`], but materializes the coverage
+    /// directly in clockwise-rotated orientation. Only one `width * height`
+    /// buffer is allocated; a horizontal rasterization plus a rotation would
+    /// briefly hold two.
+    pub(crate) fn rasterize_word_rotated(
+        &mut self,
+        font: &FontArc,
+        word: &str,
+        font_size: f32,
+        canvas_width: u32,
+        canvas_height: u32,
+    ) -> Option<AlphaBitmap> {
+        self.rasterize_word_impl(font, word, font_size, canvas_width, canvas_height, true)
+    }
+
+    fn rasterize_word_impl(
+        &mut self,
+        font: &FontArc,
+        word: &str,
+        font_size: f32,
+        canvas_width: u32,
+        canvas_height: u32,
+        rotated: bool,
+    ) -> Option<AlphaBitmap> {
         let glyphs = Self::layout_word(font, word, font_size);
         let bounds = self.word_bounds(font, &glyphs, font_size, canvas_width, canvas_height)?;
-        let width_usize = usize::try_from(bounds.width).ok()?;
-        let mut alpha = vec![0_u8; width_usize.checked_mul(bounds.height as usize)?];
+        let (output_width, output_height) = if rotated {
+            (bounds.height, bounds.width)
+        } else {
+            (bounds.width, bounds.height)
+        };
+        let width_usize = usize::try_from(output_width).ok()?;
+        let mut alpha = vec![0_u8; width_usize.checked_mul(output_height as usize)?];
 
         for positioned in &glyphs {
             self.glyph_cache
@@ -248,23 +289,43 @@ impl TextRasterizer {
                         base_x + i64::from(glyph.width) <= i64::from(bounds.width)
                             && base_y + i64::from(glyph.height) <= i64::from(bounds.height)
                     );
-                    let base_x = base_x as usize;
-                    let base_y = base_y as usize;
-                    let source_rows = glyph.coverage.chunks_exact(glyph.width as usize);
-                    let target_rows = alpha.chunks_exact_mut(width_usize).skip(base_y);
-                    for (source_row, target_row) in source_rows.zip(target_rows) {
-                        let target_row =
-                            &mut target_row[base_x..base_x + glyph.width as usize];
-                        for (target, source) in target_row.iter_mut().zip(source_row) {
-                            *target = (*target).max(*source);
+                    if !rotated {
+                        let base_x = base_x as usize;
+                        let base_y = base_y as usize;
+                        let source_rows = glyph.coverage.chunks_exact(glyph.width as usize);
+                        let target_rows = alpha.chunks_exact_mut(width_usize).skip(base_y);
+                        for (source_row, target_row) in source_rows.zip(target_rows) {
+                            let target_row = &mut target_row[base_x..base_x + glyph.width as usize];
+                            for (target, source) in target_row.iter_mut().zip(source_row) {
+                                *target = (*target).max(*source);
+                            }
+                        }
+                    } else {
+                        // Clockwise 90-degree mapping: source (gx, gy) lands
+                        // at (output_width - 1 - gy, gx). `base_x`/`base_y`
+                        // already account for the horizontal bounds offset.
+                        let output_width_i64 = i64::from(output_width);
+                        for gy in 0..glyph.height {
+                            let target_x =
+                                (output_width_i64 - 1 - (base_y + i64::from(gy))) as usize;
+                            let source_row = &glyph.coverage[(gy * glyph.width) as usize
+                                ..(gy * glyph.width + glyph.width) as usize];
+                            for (gx, coverage) in source_row.iter().enumerate() {
+                                if *coverage == 0 {
+                                    continue;
+                                }
+                                let target_y = (base_x + i64::from(gx as u32)) as usize;
+                                let target = target_y * width_usize + target_x;
+                                alpha[target] = alpha[target].max(*coverage);
+                            }
                         }
                     }
                 });
         }
 
         Some(AlphaBitmap {
-            width: bounds.width,
-            height: bounds.height,
+            width: output_width,
+            height: output_height,
             alpha,
         })
     }
@@ -324,7 +385,9 @@ impl GlyphRasterCache {
         self.entries.insert(key, rasterized);
         debug_assert!(self.used_bytes <= self.capacity_bytes);
         Some(use_glyph(
-            self.entries.get(&key).expect("inserted glyph must be cached"),
+            self.entries
+                .get(&key)
+                .expect("inserted glyph must be cached"),
         ))
     }
 }
@@ -364,8 +427,7 @@ mod tests {
     use super::*;
 
     fn test_font() -> FontArc {
-        FontArc::try_from_slice(include_bytes!("../assets/OpenSans-Regular.ttf") as &[u8])
-            .unwrap()
+        FontArc::try_from_slice(include_bytes!("../assets/OpenSans-Regular.ttf") as &[u8]).unwrap()
     }
 
     /// An independent, cache-free rasterization used to cross-check the
@@ -432,7 +494,8 @@ mod tests {
             let base_x = (bounds.min.x.floor() as i64 - min_x) as usize;
             let base_y = (bounds.min.y.floor() as i64 - min_y) as usize;
             glyph.draw(|glyph_x, glyph_y, value| {
-                let target = (base_y + glyph_y as usize) * width as usize + base_x + glyph_x as usize;
+                let target =
+                    (base_y + glyph_y as usize) * width as usize + base_x + glyph_x as usize;
                 let coverage = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
                 alpha[target] = alpha[target].max(coverage);
             });
@@ -443,6 +506,33 @@ mod tests {
             height,
             alpha,
         })
+    }
+
+    #[test]
+    fn rotated_rasterization_matches_horizontal_then_rotate() {
+        let font = test_font();
+        let mut rasterizer = TextRasterizer::new();
+
+        for (word, font_size) in [
+            ("Rust", 61.0),
+            ("glyph", 27.0),
+            ("affinity", 43.0),
+            ("vertical", 19.0),
+        ] {
+            let horizontal = rasterizer
+                .rasterize_word(&font, word, font_size, 500, 240)
+                .unwrap();
+            let rotated = rasterizer
+                .rasterize_word_rotated(&font, word, font_size, 500, 240)
+                .unwrap();
+            let expected = horizontal.rotate_clockwise();
+            assert_eq!(
+                (rotated.width, rotated.height),
+                (expected.width, expected.height),
+                "{word}"
+            );
+            assert_eq!(rotated.alpha, expected.alpha, "{word}");
+        }
     }
 
     #[test]

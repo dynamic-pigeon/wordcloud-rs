@@ -6,6 +6,7 @@ pub(crate) struct AlphaBitmap {
 }
 
 impl AlphaBitmap {
+    #[cfg(test)]
     pub fn rotate_clockwise(&self) -> Self {
         let mut alpha = vec![0; self.alpha.len()];
         for y in 0..self.height {

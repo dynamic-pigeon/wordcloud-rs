@@ -871,18 +871,34 @@ impl WordCloud {
             let Some((ink, orientation, x, y)) = selected else {
                 continue;
             };
-            let Some(horizontal) = text_rasterizer.rasterize_word(
-                &self.font,
-                &frequency.word,
-                font_size,
-                usable_width,
-                usable_height,
-            ) else {
-                continue;
-            };
             let bitmap = match orientation {
-                Orientation::Horizontal => horizontal,
-                Orientation::Vertical => horizontal.rotate_clockwise(),
+                Orientation::Horizontal => {
+                    let Some(bitmap) = text_rasterizer.rasterize_word(
+                        &self.font,
+                        &frequency.word,
+                        font_size,
+                        usable_width,
+                        usable_height,
+                    ) else {
+                        continue;
+                    };
+                    bitmap
+                }
+                Orientation::Vertical => {
+                    // Rasterize straight into rotated coordinates: the
+                    // horizontal buffer would otherwise exist only to be
+                    // rotated, holding two `width * height` buffers at once.
+                    let Some(bitmap) = text_rasterizer.rasterize_word_rotated(
+                        &self.font,
+                        &frequency.word,
+                        font_size,
+                        usable_width,
+                        usable_height,
+                    ) else {
+                        continue;
+                    };
+                    bitmap
+                }
             };
             if !occupied.insert(&ink, x, y) {
                 continue;
@@ -1025,7 +1041,11 @@ impl Font for ArcBorrowedFont {
     fn codepoint_ids(&self) -> CodepointIdIter<'_> {
         self.font.codepoint_ids()
     }
-    fn glyph_raster_image2(&self, id: GlyphId, pixel_size: u16) -> Option<ab_glyph::v2::GlyphImage<'_>> {
+    fn glyph_raster_image2(
+        &self,
+        id: GlyphId,
+        pixel_size: u16,
+    ) -> Option<ab_glyph::v2::GlyphImage<'_>> {
         self.font.glyph_raster_image2(id, pixel_size)
     }
 }
@@ -1118,26 +1138,31 @@ fn extend_with_repeats(
     mut renderable: Vec<(usize, WordFrequency)>,
     max_words: usize,
 ) -> Vec<(usize, WordFrequency)> {
-    if renderable.len() >= max_words {
+    let originals_len = renderable.len();
+    if originals_len >= max_words {
         return renderable;
     }
     let max_frequency = renderable[0].1.frequency;
-    let downweight = renderable[renderable.len() - 1].1.frequency / max_frequency;
-    let originals = renderable.clone();
-    let times_extend = max_words.div_ceil(originals.len()) - 1;
-    for round in 1..=times_extend {
+    let downweight = renderable[originals_len - 1].1.frequency / max_frequency;
+    let rounds = max_words.div_ceil(originals_len) - 1;
+    for round in 1..=rounds {
+        // Only clone the words the final round actually keeps, so the last
+        // round never allocates strings that `truncate` would discard.
+        let count = (max_words - round * originals_len).min(originals_len);
         let scale = downweight.powi(round as i32);
-        renderable.extend(originals.iter().map(|(rank, frequency)| {
-            (
+        // Indexed access keeps the borrow short: `push` may reallocate the
+        // backing buffer between iterations.
+        for index in 0..count {
+            let (rank, frequency) = &renderable[index];
+            renderable.push((
                 *rank,
                 WordFrequency {
                     word: frequency.word.clone(),
                     frequency: frequency.frequency * scale,
                 },
-            )
-        }));
+            ));
+        }
     }
-    renderable.truncate(max_words);
     renderable
 }
 
