@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use ab_glyph::{point, Font, FontArc, Glyph, GlyphId, PxScale, ScaleFont};
 
@@ -216,17 +216,31 @@ impl TextRasterizer {
                 .with_rasterized(font, positioned.id, font_size, |glyph| {
                     let base_x = positioned.x.round() as i64 + glyph.offset_x - bounds.min_x;
                     let base_y = glyph.offset_y - bounds.min_y;
+                    debug_assert!(base_x >= 0 && base_y >= 0);
+                    debug_assert!(
+                        base_x + i64::from(glyph.width) <= i64::from(bounds.width)
+                            && base_y + i64::from(glyph.height) <= i64::from(bounds.height)
+                    );
+                    // Columns are packed into 8-wide bit groups so a solid
+                    // glyph row is written with one shifted word OR instead
+                    // of eight per-pixel sets.
                     for row in 0..glyph.height {
                         let y = base_y + i64::from(row);
-                        for column in 0..glyph.width {
-                            if glyph.coverage[(row * glyph.width + column) as usize] != 0 {
-                                let x = base_x + i64::from(column);
-                                debug_assert!(x >= 0 && y >= 0);
-                                debug_assert!(
-                                    x < i64::from(bounds.width) && y < i64::from(bounds.height)
-                                );
-                                ink.set(x as u32, y as u32);
+                        let coverage = &glyph.coverage[(row * glyph.width) as usize
+                            ..(row * glyph.width + glyph.width) as usize];
+                        let mut column = 0_u32;
+                        while column < glyph.width {
+                            let take = (glyph.width - column).min(8);
+                            let mut bits = 0_u64;
+                            for bit in 0..take {
+                                if coverage[(column + bit) as usize] != 0 {
+                                    bits |= 1_u64 << bit;
+                                }
                             }
+                            if bits != 0 {
+                                ink.or_bits((base_x + i64::from(column)) as u32, y as u32, bits);
+                            }
+                            column += take;
                         }
                     }
                 });
@@ -339,6 +353,8 @@ impl Default for TextRasterizer {
 
 struct GlyphRasterCache {
     entries: HashMap<(GlyphId, u32), CachedGlyph>,
+    /// Insertion order of `entries`, for first-in-first-out eviction.
+    order: VecDeque<(GlyphId, u32)>,
     capacity_bytes: usize,
     max_entries: usize,
     used_bytes: usize,
@@ -348,6 +364,7 @@ impl GlyphRasterCache {
     fn new(capacity_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            order: VecDeque::new(),
             capacity_bytes,
             max_entries: DEFAULT_GLYPH_CACHE_MAX_ENTRIES,
             used_bytes: 0,
@@ -375,14 +392,23 @@ impl GlyphRasterCache {
             return Some(use_glyph(&rasterized));
         }
 
-        if self.entries.len() >= self.max_entries
+        // Evict oldest-first until the new glyph fits. Clearing everything
+        // instead would throw away the current word's glyphs between the
+        // placement search and the final rasterization, forcing every placed
+        // word to be rasterized twice.
+        while self.entries.len() >= self.max_entries
             || self.used_bytes > self.capacity_bytes - allocation_bytes
         {
-            self.entries.clear();
-            self.used_bytes = 0;
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.used_bytes -= removed.coverage.capacity();
+            }
         }
         self.used_bytes += allocation_bytes;
         self.entries.insert(key, rasterized);
+        self.order.push_back(key);
         debug_assert!(self.used_bytes <= self.capacity_bytes);
         Some(use_glyph(
             self.entries
@@ -603,6 +629,11 @@ mod tests {
                     .map(|glyph| glyph.coverage.capacity())
                     .sum::<usize>()
             );
+            // The eviction queue lists every cached key exactly once.
+            assert_eq!(rasterizer.glyph_cache.order.len(), rasterizer.glyph_cache.entries.len());
+            for key in &rasterizer.glyph_cache.order {
+                assert!(rasterizer.glyph_cache.entries.contains_key(key));
+            }
         }
         assert!(!rasterizer.glyph_cache.entries.is_empty());
     }

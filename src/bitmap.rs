@@ -47,6 +47,18 @@ pub(crate) struct BitGrid {
     rows: Vec<u64>,
 }
 
+/// The nonzero words of a candidate grid, compacted once so repeated
+/// collision probes skip empty rows and words entirely. Built by
+/// [`BitGrid::collision_plan`] and consumed by
+/// [`BitGrid::collides_with_plan`].
+#[derive(Debug)]
+pub(crate) struct CollisionPlan {
+    width: u32,
+    height: u32,
+    /// `(row, word, value)` of every nonzero word, in row-major order.
+    entries: Vec<(u32, u32, u64)>,
+}
+
 impl BitGrid {
     pub fn new(width: u32, height: u32) -> Self {
         let stride = (width as usize).div_ceil(64);
@@ -67,13 +79,19 @@ impl BitGrid {
     }
 
     /// Returns a copy rotated 90 degrees clockwise, matching
-    /// [`AlphaBitmap::rotate_clockwise`].
+    /// [`AlphaBitmap::rotate_clockwise`]. Only set bits are visited, so the
+    /// cost scales with ink rather than with the grid area.
     pub fn rotate_clockwise(&self) -> Self {
         let mut rotated = Self::new(self.height, self.width);
-        for y in 0..self.height {
-            for x in 0..self.width {
-                if self.get(x, y) {
-                    rotated.set(self.height - 1 - y, x);
+        for y in 0..self.height as usize {
+            let row_start = y * self.stride;
+            for word in 0..self.stride {
+                let mut value = self.rows[row_start + word];
+                while value != 0 {
+                    let bit = value.trailing_zeros();
+                    let x = word as u32 * 64 + bit;
+                    rotated.set(self.height - 1 - y as u32, x);
+                    value &= value - 1;
                 }
             }
         }
@@ -199,10 +217,82 @@ impl BitGrid {
         self.collides_in_bounds(other, x, y)
     }
 
+    #[cfg(test)]
     pub fn collides_in_bounds(&self, other: &Self, x: u32, y: u32) -> bool {
         debug_assert!(x + other.width <= self.width);
         debug_assert!(y + other.height <= self.height);
         self.for_each_shifted_chunk(other, x, y, |target, value| self.rows[target] & value != 0)
+    }
+
+    /// Compacts the nonzero words of this grid for repeated collision probes
+    /// against a fixed candidate.
+    pub fn collision_plan(&self) -> CollisionPlan {
+        let mut entries = Vec::new();
+        for y in 0..self.height as usize {
+            let row_start = y * self.stride;
+            for word in 0..self.stride {
+                let value = self.rows[row_start + word];
+                if value != 0 {
+                    entries.push((y as u32, word as u32, value));
+                }
+            }
+        }
+        CollisionPlan {
+            width: self.width,
+            height: self.height,
+            entries,
+        }
+    }
+
+    /// Like [`BitGrid::collides_in_bounds`] but scans only the nonzero words
+    /// listed in `plan`, which must describe a candidate that fits at
+    /// `(x, y)`. Returns the same answer as testing the full grid.
+    pub fn collides_with_plan(&self, plan: &CollisionPlan, x: u32, y: u32) -> bool {
+        debug_assert!(x + plan.width <= self.width);
+        debug_assert!(y + plan.height <= self.height);
+        let word_offset = x as usize / 64;
+        let shift = x % 64;
+        let mut row = usize::MAX;
+        let mut row_base = 0_usize;
+        for &(entry_row, word, value) in &plan.entries {
+            let entry_row = entry_row as usize;
+            if entry_row != row {
+                row = entry_row;
+                row_base = (y as usize + row) * self.stride;
+            }
+            let target = row_base + word_offset + word as usize;
+            if self.rows[target] & (value << shift) != 0 {
+                return true;
+            }
+            if shift != 0 {
+                let target = target + 1;
+                // Same row bound as `for_each_shifted_chunk`: the second word
+                // only exists while the shifted candidate stays inside it.
+                if target < row_base + self.stride
+                    && self.rows[target] & (value >> (64 - shift)) != 0
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// ORs the low bits of `bits` into row `y` starting at column `x`.
+    /// Caller guarantees that every set bit of `bits` corresponds to a
+    /// column below `width`.
+    pub(crate) fn or_bits(&mut self, x: u32, y: u32, bits: u64) {
+        debug_assert!(x < self.width && y < self.height);
+        let index = y as usize * self.stride + x as usize / 64;
+        let shift = x % 64;
+        self.rows[index] |= bits << shift;
+        if shift != 0 {
+            let spill = bits >> (64 - shift);
+            if spill != 0 {
+                debug_assert!(index + 1 < self.rows.len());
+                self.rows[index + 1] |= spill;
+            }
+        }
     }
 
     pub fn insert(&mut self, other: &Self, x: u32, y: u32) -> bool {
@@ -236,6 +326,7 @@ impl BitGrid {
         true
     }
 
+    #[cfg(test)]
     fn for_each_shifted_chunk<F>(&self, other: &Self, x: u32, y: u32, mut test: F) -> bool
     where
         F: FnMut(usize, u64) -> bool,
@@ -487,6 +578,92 @@ mod tests {
                 },
                 radius,
             );
+        }
+    }
+
+    #[test]
+    fn collision_plan_matches_full_grid_scan_across_offsets() {
+        let mut state = 0x0fc0_ffee_1234_5678_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+
+        for case in 0..200 {
+            let canvas_width = 64 + (next() % 3) as u32 * 64;
+            let canvas_height = 3 + (next() % 6) as u32;
+            let item_width = 1 + (next() % 130) as u32;
+            let item_height = 1 + (next() % 4) as u32;
+            if item_width > canvas_width || item_height > canvas_height {
+                continue;
+            }
+
+            let mut canvas = BitGrid::new(canvas_width, canvas_height);
+            for index in 0..canvas_width * canvas_height {
+                if next() % 3 == 0 {
+                    canvas.set(index % canvas_width, index / canvas_width);
+                }
+            }
+            let mut item = BitGrid::new(item_width, item_height);
+            for index in 0..item_width * item_height {
+                if next() % 2 == 0 {
+                    item.set(index % item_width, index / item_width);
+                }
+            }
+
+            let plan = item.collision_plan();
+            for y in 0..=canvas_height - item_height {
+                for x in 0..=canvas_width - item_width {
+                    assert_eq!(
+                        canvas.collides_with_plan(&plan, x, y),
+                        canvas.collides_in_bounds(&item, x, y),
+                        "case {case} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn or_bits_matches_per_pixel_sets() {
+        let mut state = 0x5eed_cafe_1234_5678_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+
+        for width in [1_u32, 8, 9, 63, 64, 65, 71] {
+            let height = 5_u32;
+            for case in 0..64 {
+                let mut packed = BitGrid::new(width, height);
+                let mut scattered = BitGrid::new(width, height);
+                for y in 0..height {
+                    let mut x = (next() % 71) as u32;
+                    while x < width {
+                        let mut bits = 0_u64;
+                        let take = (width - x).min(8);
+                        for bit in 0..take {
+                            if next() % 3 != 0 {
+                                bits |= 1_u64 << bit;
+                            }
+                        }
+                        if bits != 0 {
+                            packed.or_bits(x, y, bits);
+                            for bit in 0..take {
+                                if bits & (1 << bit) != 0 {
+                                    scattered.set(x + bit, y);
+                                }
+                            }
+                        }
+                        x += take;
+                    }
+                }
+                assert_eq!(packed, scattered, "width {width} case {case}");
+            }
         }
     }
 

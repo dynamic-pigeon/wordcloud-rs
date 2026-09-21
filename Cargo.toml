@@ -19,8 +19,8 @@ path = "src/lib.rs"
 # AAT, glyph names). This crate only rasterizes outlines, so keep the parser slim.
 ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
-thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
-unicode-segmentation = { version = "1.12.0", default-features = false }
+thiserror = { version = "2.0.20", default-features = false, features = ["std"] }
+unicode-segmentation = { version = "1.13.3", default-features = false }
 
 [dev-dependencies]
 

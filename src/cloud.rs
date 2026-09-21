@@ -1,15 +1,16 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ab_glyph::{CodepointIdIter, Font, FontArc, FontRef, FontVec, GlyphId, InvalidFont, Outline};
-use image::{ColorType, DynamicImage, ImageFormat, Pixel, Rgb, RgbImage, Rgba, RgbaImage};
+use image::{DynamicImage, ImageFormat, Pixel, Rgba, RgbaImage};
 
-use crate::bitmap::{AlphaBitmap, BitGrid};
+use crate::bitmap::{AlphaBitmap, BitGrid, CollisionPlan};
 use crate::color::{ColorContext, Colorizer, Palette, SolidColor};
 use crate::frequency::{collect_frequencies, sort_frequencies, IntoWordFrequency, WordFrequency};
 use crate::mask::Mask;
@@ -129,18 +130,13 @@ impl RenderedWordCloud {
         let format = ImageFormat::from_path(path)?;
         match format {
             ImageFormat::Jpeg => {
-                let image = RgbImage::from_fn(self.image.width(), self.image.height(), |x, y| {
-                    let pixel = self.image[(x, y)];
-                    Rgb([pixel[0], pixel[1], pixel[2]])
-                });
-                image::save_buffer_with_format(
-                    path,
-                    image.as_raw(),
-                    image.width(),
-                    image.height(),
-                    ColorType::Rgb8,
-                    format,
-                )?;
+                // The JPEG encoder consumes the image one 8x8 block at a
+                // time and drops alpha while converting each pixel to
+                // YCbCr, so encoding straight from the RGBA buffer avoids
+                // materializing a full-size RGB copy.
+                let file = fs::File::create(path).map_err(image::ImageError::IoError)?;
+                let mut encoder = image::codecs::jpeg::JpegEncoder::new(io::BufWriter::new(file));
+                encoder.encode_image(&self.image)?;
             }
             _ => self.image.save_with_format(path, format)?,
         }
@@ -544,10 +540,10 @@ impl WordCloudBuilder {
                 "is too small to reduce max_font_size at f32 precision",
             ));
         }
-        let mask_occupancy = self
+        let mask_blocked = self
             .mask
             .as_ref()
-            .map(|mask| build_mask_occupancy(mask, width, height, self.scale));
+            .map(|mask| Arc::new(build_mask_blocked(mask, width, height, self.scale)));
 
         Ok(WordCloud {
             width,
@@ -564,7 +560,7 @@ impl WordCloudBuilder {
             random_seed: self.random_seed,
             background_color: self.background_color,
             font,
-            mask_occupancy,
+            mask_blocked,
             tokenizer: self.tokenizer,
             stopwords: self.stopwords,
             lowercase: self.lowercase,
@@ -594,7 +590,10 @@ pub struct WordCloud {
     random_seed: Option<u64>,
     background_color: Rgba<u8>,
     font: FontArc,
-    mask_occupancy: Option<BitGrid>,
+    /// Pixels the mask forbids. Shared immutably across [`WordCloud`] clones
+    /// (cloning the generator no longer deep-copies the grid); each
+    /// generation works on its own merged copy for fast collision probes.
+    mask_blocked: Option<Arc<BitGrid>>,
     tokenizer: Arc<dyn Tokenizer>,
     stopwords: StopWords,
     lowercase: bool,
@@ -947,8 +946,12 @@ impl WordCloud {
     }
 
     fn initial_occupancy(&self) -> BitGrid {
-        self.mask_occupancy
-            .clone()
+        // One memcpy per generation keeps collision probes single-grid: a
+        // separate immutable mask check measurably doubles the placement
+        // search time, far outweighing this transient copy.
+        self.mask_blocked
+            .as_deref()
+            .cloned()
             .unwrap_or_else(|| BitGrid::new(self.width, self.height))
     }
 
@@ -1175,10 +1178,11 @@ fn next_font_size(current: f32, step: f32, minimum: f32) -> f32 {
     }
 }
 
-fn build_mask_occupancy(mask: &Mask, width: u32, height: u32, scale: u32) -> BitGrid {
+/// Builds a grid marking the pixels the mask forbids, at output scale.
+fn build_mask_blocked(mask: &Mask, width: u32, height: u32, scale: u32) -> BitGrid {
     debug_assert_eq!(width, mask.width() * scale);
     debug_assert_eq!(height, mask.height() * scale);
-    let mut occupied = BitGrid::new(width, height);
+    let mut blocked = BitGrid::new(width, height);
     for mask_y in 0..mask.height() {
         for mask_x in 0..mask.width() {
             if mask.allowed_grid().get(mask_x, mask_y) {
@@ -1188,12 +1192,12 @@ fn build_mask_occupancy(mask: &Mask, width: u32, height: u32, scale: u32) -> Bit
             let start_y = mask_y * scale;
             for y in start_y..start_y + scale {
                 for x in start_x..start_x + scale {
-                    occupied.set(x, y);
+                    blocked.set(x, y);
                 }
             }
         }
     }
-    occupied
+    blocked
 }
 
 fn bitmap_fits_with_margin(
@@ -1245,6 +1249,9 @@ fn find_position(
 ) -> Option<(u32, u32)> {
     let max_x = occupied.width().checked_sub(candidate.width())?;
     let max_y = occupied.height().checked_sub(candidate.height())?;
+    // The candidate is fixed across all probes below, so its nonzero words
+    // are compacted once and every probe scans only those.
+    let plan = candidate.collision_plan();
     // Try a center-biased random position first. This lets the dominant word
     // move between generations while keeping the composition near the middle.
     let biased_attempts = attempts.min(96);
@@ -1253,7 +1260,7 @@ fn find_position(
             / 2) as u32;
         let y = ((u64::from(rng.range_inclusive(max_y)) + u64::from(rng.range_inclusive(max_y)))
             / 2) as u32;
-        if position_is_free(occupied, candidate, x, y) {
+        if position_is_free(occupied, &plan, x, y) {
             return Some((x, y));
         }
     }
@@ -1261,7 +1268,7 @@ fn find_position(
     // The exact center remains a reliable fallback for sparse random misses
     // and restrictive masks.
     let center = (max_x / 2, max_y / 2);
-    if position_is_free(occupied, candidate, center.0, center.1) {
+    if position_is_free(occupied, &plan, center.0, center.1) {
         return Some(center);
     }
 
@@ -1280,7 +1287,7 @@ fn find_position(
     for _ in 0..checks {
         let x = (index % positions_per_row) as u32;
         let y = (index / positions_per_row) as u32;
-        if position_is_free(occupied, candidate, x, y) {
+        if position_is_free(occupied, &plan, x, y) {
             return Some((x, y));
         }
         index = (index + step) % total;
@@ -1288,8 +1295,8 @@ fn find_position(
     None
 }
 
-fn position_is_free(occupied: &BitGrid, candidate: &BitGrid, x: u32, y: u32) -> bool {
-    !occupied.collides_in_bounds(candidate, x, y)
+fn position_is_free(occupied: &BitGrid, plan: &CollisionPlan, x: u32, y: u32) -> bool {
+    !occupied.collides_with_plan(plan, x, y)
 }
 
 fn gcd(mut left: u64, mut right: u64) -> u64 {
@@ -1315,7 +1322,7 @@ fn blend_bitmap(image: &mut RgbaImage, bitmap: &AlphaBitmap, word: &PlacedWord) 
         for (coverage, target) in alpha_row
             .iter()
             .copied()
-            .zip(target_row.chunks_exact_mut(4))
+            .zip(target_row.as_chunks_mut::<4>().0)
         {
             if coverage == 0 {
                 continue;
@@ -1532,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_mask_occupancy_matches_pixel_mapping() {
+    fn mask_blocked_grid_matches_pixel_mapping() {
         for logical_width in [63, 64, 65, 127] {
             let logical_height = 7;
             let mask = Mask::from_predicate(logical_width, logical_height, |x, y| {
@@ -1542,7 +1549,7 @@ mod tests {
             for scale in [1, 2, 3] {
                 let width = logical_width * scale;
                 let height = logical_height * scale;
-                let occupied = build_mask_occupancy(&mask, width, height, scale);
+                let occupied = build_mask_blocked(&mask, width, height, scale);
                 for y in 0..height {
                     for x in 0..width {
                         assert_eq!(occupied.get(x, y), !mask.is_allowed(x / scale, y / scale));
@@ -1554,6 +1561,8 @@ mod tests {
 
     #[test]
     fn cached_mask_is_not_mutated_between_generations() {
+        // With the shared blocked grid this holds by construction: layout
+        // never writes into `mask_blocked`, only into its own occupancy.
         let mask = Mask::from_predicate(127, 83, |x, y| {
             x > 2 && y > 1 && x < 124 && y < 81 && !((47..80).contains(&x) && y < 27)
         })
@@ -1646,6 +1655,48 @@ mod tests {
             .generate_detailed_from_frequencies([("rust", 30), ("cloud", 20)])
             .unwrap();
         assert!(!rendered.words().is_empty());
+    }
+
+    #[test]
+    fn jpeg_streaming_save_matches_explicit_rgb_conversion() {
+        let cloud = WordCloud::builder()
+            .dimensions(140, 90)
+            .transparent_background()
+            .random_seed(91)
+            .build()
+            .unwrap();
+        let rendered = cloud
+            .generate_detailed_from_frequencies([("rust", 30), ("cloud", 20), ("jpeg", 10)])
+            .unwrap();
+
+        // New path: encode straight from the RGBA buffer.
+        let mut streamed = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut streamed)
+            .encode_image(rendered.image())
+            .unwrap();
+
+        // Old path: convert to RGB first, then encode.
+        let reference = image::RgbImage::from_fn(
+            rendered.image().width(),
+            rendered.image().height(),
+            |x, y| {
+                let pixel = rendered.image()[(x, y)];
+                image::Rgb([pixel[0], pixel[1], pixel[2]])
+            },
+        );
+        let mut expected = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new(&mut expected);
+        use image::ImageEncoder;
+        encoder
+            .write_image(
+                reference.as_raw(),
+                reference.width(),
+                reference.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+
+        assert_eq!(streamed, expected);
     }
 
     #[test]
