@@ -28,6 +28,10 @@ mod mask;
 mod text;
 mod tokenizer;
 
+/// Upper bound on the pixels of a mask or output canvas, bounding the size
+/// of the per-generation allocations built from them.
+pub(crate) const MAX_CANVAS_PIXELS: u64 = 16_000_000;
+
 pub use cloud::{
     FontSource, Orientation, PlacedWord, RenderedWordCloud, WordCloud, WordCloudBuilder,
 };

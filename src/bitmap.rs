@@ -47,18 +47,6 @@ pub(crate) struct BitGrid {
     rows: Vec<u64>,
 }
 
-/// The nonzero words of a candidate grid, compacted once so repeated
-/// collision probes skip empty rows and words entirely. Built by
-/// [`BitGrid::collision_plan`] and consumed by
-/// [`BitGrid::collides_with_plan`].
-#[derive(Debug)]
-pub(crate) struct CollisionPlan {
-    width: u32,
-    height: u32,
-    /// `(row, word, value)` of every nonzero word, in row-major order.
-    entries: Vec<(u32, u32, u64)>,
-}
-
 impl BitGrid {
     pub fn new(width: u32, height: u32) -> Self {
         let stride = (width as usize).div_ceil(64);
@@ -98,99 +86,98 @@ impl BitGrid {
         rotated
     }
 
-    /// Returns an ink mask expanded by `radius`, with the original grid
-    /// located at `(radius, radius)` inside it.
-    pub fn dilated(&self, radius: u32) -> Option<Self> {
-        const WORDWISE_DILATION_MAX_RADIUS: u32 = 8;
-
-        let width = self.width.checked_add(radius.checked_mul(2)?)?;
-        let height = self.height.checked_add(radius.checked_mul(2)?)?;
-        if radius == 0 {
-            return Some(self.clone());
+    /// Positions where a `width` x `height` window is completely free, as a
+    /// `(self.width - width + 1)` x `(self.height - height + 1)` grid whose
+    /// bit `(x, y)` means "the window with its top-left corner at `(x, y)`
+    /// covers no set bit of this grid". Returns `None` when the window is
+    /// larger than this grid in either dimension.
+    ///
+    /// This is the bit-grid equivalent of the Python `wordcloud` integral
+    /// image query: two sliding passes (horizontal, then vertical) erode the
+    /// free space, so every valid placement is enumerable exactly once.
+    pub fn free_windows(&self, width: u32, height: u32) -> Option<BitGrid> {
+        if width == 0 || height == 0 || width > self.width || height > self.height {
+            return None;
         }
-
-        let diameter = radius.checked_mul(2)?.checked_add(1)?;
-        if radius <= WORDWISE_DILATION_MAX_RADIUS {
-            Some(self.dilated_wordwise(width, height, diameter))
-        } else {
-            Some(self.dilated_sliding(width, height, diameter))
-        }
-    }
-
-    fn dilated_sliding(&self, width: u32, height: u32, diameter: u32) -> Self {
-        // Two sliding-window passes perform a square dilation in O(output
-        // area) while retaining the compact bit-grid memory footprint.
-        let mut horizontal = Self::new(width, self.height);
+        let horizontal_width = self.width - width + 1;
+        let mut horizontal = BitGrid::new(horizontal_width, self.height);
         for y in 0..self.height {
-            let mut ink_count = 0_u32;
-            for output_x in 0..width {
-                if output_x < self.width && self.get(output_x, y) {
-                    ink_count += 1;
+            let mut occupied_count = 0_u32;
+            for x in 0..width {
+                if self.get(x, y) {
+                    occupied_count += 1;
                 }
-                if let Some(expired_x) = output_x.checked_sub(diameter) {
-                    if expired_x < self.width && self.get(expired_x, y) {
-                        ink_count -= 1;
-                    }
+            }
+            if occupied_count == 0 {
+                horizontal.set(0, y);
+            }
+            for start in 1..horizontal_width {
+                if self.get(start + width - 1, y) {
+                    occupied_count += 1;
                 }
-                if ink_count != 0 {
-                    horizontal.set(output_x, y);
+                if self.get(start - 1, y) {
+                    occupied_count -= 1;
+                }
+                if occupied_count == 0 {
+                    horizontal.set(start, y);
                 }
             }
         }
 
-        let mut dilated = Self::new(width, height);
-        for x in 0..width {
-            let mut ink_count = 0_u32;
-            for output_y in 0..height {
-                if output_y < self.height && horizontal.get(x, output_y) {
-                    ink_count += 1;
+        let mut valid = BitGrid::new(horizontal_width, self.height - height + 1);
+        for x in 0..horizontal_width {
+            let mut free_count = 0_u32;
+            for y in 0..height {
+                if horizontal.get(x, y) {
+                    free_count += 1;
                 }
-                if let Some(expired_y) = output_y.checked_sub(diameter) {
-                    if expired_y < self.height && horizontal.get(x, expired_y) {
-                        ink_count -= 1;
-                    }
+            }
+            if free_count == height {
+                valid.set(x, 0);
+            }
+            for start in 1..valid.height() {
+                if horizontal.get(x, start + height - 1) {
+                    free_count += 1;
                 }
-                if ink_count != 0 {
-                    dilated.set(x, output_y);
+                if horizontal.get(x, start - 1) {
+                    free_count -= 1;
+                }
+                if free_count == height {
+                    valid.set(x, start);
                 }
             }
         }
-        dilated
+        Some(valid)
     }
 
-    fn dilated_wordwise(&self, width: u32, height: u32, diameter: u32) -> Self {
-        let mut dilated = Self::new(width, height);
-        let mut expanded_row = vec![0_u64; dilated.stride];
+    /// The number of set bits.
+    pub fn popcount(&self) -> u64 {
+        self.rows
+            .iter()
+            .map(|word| u64::from(word.count_ones()))
+            .sum()
+    }
 
-        for source_y in 0..self.height as usize {
-            expanded_row.fill(0);
-            let source_start = source_y * self.stride;
-            for source_word in 0..self.stride {
-                let value = self.rows[source_start + source_word];
-                if value == 0 {
-                    continue;
+    /// The `goal`-th set bit in row-major order, or `None` when `goal` is
+    /// out of range.
+    pub fn select_set(&self, goal: u64) -> Option<(u32, u32)> {
+        let mut goal = goal;
+        for (index, &word) in self.rows.iter().enumerate() {
+            let ones = u64::from(word.count_ones());
+            if goal < ones {
+                let mut remaining = word;
+                for _ in 0..goal {
+                    remaining &= remaining - 1;
                 }
-
-                for shift in 0..diameter {
-                    expanded_row[source_word] |= value << shift;
-                    if shift != 0 && source_word + 1 < expanded_row.len() {
-                        expanded_row[source_word + 1] |= value >> (64 - shift);
-                    }
-                }
+                // `rows` is flat with `stride` words per row, so decode the
+                // flat word index into (row, word) before adding the bit.
+                let y = (index / self.stride) as u32;
+                let x = (index % self.stride) as u32 * 64 + remaining.trailing_zeros();
+                return Some((x, y));
             }
-
-            for target_y in source_y..source_y + diameter as usize {
-                let target_start = target_y * dilated.stride;
-                for (target, expanded) in dilated.rows[target_start..target_start + dilated.stride]
-                    .iter_mut()
-                    .zip(&expanded_row)
-                {
-                    *target |= *expanded;
-                }
-            }
+            goal -= ones;
         }
-
-        dilated
+        None
     }
 
     pub fn set(&mut self, x: u32, y: u32) {
@@ -222,60 +209,6 @@ impl BitGrid {
         debug_assert!(x + other.width <= self.width);
         debug_assert!(y + other.height <= self.height);
         self.for_each_shifted_chunk(other, x, y, |target, value| self.rows[target] & value != 0)
-    }
-
-    /// Compacts the nonzero words of this grid for repeated collision probes
-    /// against a fixed candidate.
-    pub fn collision_plan(&self) -> CollisionPlan {
-        let mut entries = Vec::new();
-        for y in 0..self.height as usize {
-            let row_start = y * self.stride;
-            for word in 0..self.stride {
-                let value = self.rows[row_start + word];
-                if value != 0 {
-                    entries.push((y as u32, word as u32, value));
-                }
-            }
-        }
-        CollisionPlan {
-            width: self.width,
-            height: self.height,
-            entries,
-        }
-    }
-
-    /// Like [`BitGrid::collides_in_bounds`] but scans only the nonzero words
-    /// listed in `plan`, which must describe a candidate that fits at
-    /// `(x, y)`. Returns the same answer as testing the full grid.
-    pub fn collides_with_plan(&self, plan: &CollisionPlan, x: u32, y: u32) -> bool {
-        debug_assert!(x + plan.width <= self.width);
-        debug_assert!(y + plan.height <= self.height);
-        let word_offset = x as usize / 64;
-        let shift = x % 64;
-        let mut row = usize::MAX;
-        let mut row_base = 0_usize;
-        for &(entry_row, word, value) in &plan.entries {
-            let entry_row = entry_row as usize;
-            if entry_row != row {
-                row = entry_row;
-                row_base = (y as usize + row) * self.stride;
-            }
-            let target = row_base + word_offset + word as usize;
-            if self.rows[target] & (value << shift) != 0 {
-                return true;
-            }
-            if shift != 0 {
-                let target = target + 1;
-                // Same row bound as `for_each_shifted_chunk`: the second word
-                // only exists while the shifted candidate stays inside it.
-                if target < row_base + self.stride
-                    && self.rows[target] & (value >> (64 - shift)) != 0
-                {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// ORs the low bits of `bits` into row `y` starting at column `x`.
@@ -361,36 +294,6 @@ impl BitGrid {
 mod tests {
     use super::*;
 
-    fn dilation_oracle(bitmap: &AlphaBitmap, radius: u32) -> Option<BitGrid> {
-        let padding = radius.checked_mul(2)?;
-        let width = bitmap.width.checked_add(padding)?;
-        let height = bitmap.height.checked_add(padding)?;
-        let mut expected = BitGrid::new(width, height);
-
-        for y in 0..bitmap.height {
-            for x in 0..bitmap.width {
-                if bitmap.alpha[(y * bitmap.width + x) as usize] == 0 {
-                    continue;
-                }
-                for expanded_y in y..=y + padding {
-                    for expanded_x in x..=x + padding {
-                        expected.set(expanded_x, expanded_y);
-                    }
-                }
-            }
-        }
-        Some(expected)
-    }
-
-    fn assert_dilation_matches_oracle(bitmap: &AlphaBitmap, radius: u32) {
-        let actual = bitmap.bits().dilated(radius).unwrap();
-        let expected = dilation_oracle(bitmap, radius).unwrap();
-        assert_eq!(actual.width, expected.width);
-        assert_eq!(actual.height, expected.height);
-        assert_eq!(actual.stride, expected.stride);
-        assert_eq!(actual.rows, expected.rows);
-    }
-
     #[test]
     fn shifted_collision_and_insert_cross_word_boundaries() {
         for x in [0, 1, 63, 64, 65, 127] {
@@ -455,55 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn dilation_expands_once_around_ink() {
-        let bitmap = AlphaBitmap {
-            width: 3,
-            height: 2,
-            alpha: vec![0, 0, 0, 0, 255, 0],
-        };
-        let expanded = bitmap.bits().dilated(2).unwrap();
-        assert_eq!((expanded.width(), expanded.height()), (7, 6));
-        for y in 1..=5 {
-            for x in 1..=5 {
-                assert!(expanded.get(x, y));
-            }
-        }
-        assert!(!expanded.get(0, 0));
-    }
-
-    #[test]
-    fn dilation_matches_oracle_at_word_boundaries_and_fast_path_boundary() {
-        const WIDTHS: [u32; 14] = [1, 2, 3, 62, 63, 64, 65, 66, 126, 127, 128, 129, 130, 191];
-        const HEIGHTS: [u32; 4] = [1, 2, 3, 7];
-        const RADII: [u32; 7] = [0, 1, 2, 3, 8, 9, 13];
-
-        for width in WIDTHS {
-            for height in HEIGHTS {
-                let len = (width * height) as usize;
-                let patterns = [
-                    vec![0; len],
-                    vec![255; len],
-                    (0..len).map(|index| u8::from(index % 67 == 0)).collect(),
-                    (0..len)
-                        .map(|index| u8::from((index * 37 + 11) % 101 < 9))
-                        .collect(),
-                ];
-
-                for alpha in patterns {
-                    let bitmap = AlphaBitmap {
-                        width,
-                        height,
-                        alpha,
-                    };
-                    for radius in RADII {
-                        assert_dilation_matches_oracle(&bitmap, radius);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn bit_grid_rotation_matches_bitmap_rotation() {
         let bitmap = AlphaBitmap {
             width: 5,
@@ -530,100 +384,6 @@ mod tests {
         assert_eq!(quadruple.width, original.width);
         assert_eq!(quadruple.height, original.height);
         assert_eq!(quadruple.rows, original.rows);
-    }
-
-    #[test]
-    fn randomized_dilation_matches_pixel_oracle() {
-        let boundary_widths = [1, 2, 63, 64, 65, 127, 128, 129];
-        let mut state = 0x4d59_5df4_d0f3_3173_u64;
-
-        for case in 0..256 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let width = if case % 2 == 0 {
-                boundary_widths[(state as usize) % boundary_widths.len()]
-            } else {
-                (state as u32 % 160) + 1
-            };
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let height = (state as u32 % 19) + 1;
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let radius = match case % 8 {
-                0 => 0,
-                1 => 1,
-                2 => 2,
-                3 => 8,
-                4 => 9,
-                _ => state as u32 % 17,
-            };
-
-            let mut alpha = Vec::with_capacity((width * height) as usize);
-            for _ in 0..width * height {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                alpha.push(u8::from(state >> 58 == 0));
-            }
-
-            assert_dilation_matches_oracle(
-                &AlphaBitmap {
-                    width,
-                    height,
-                    alpha,
-                },
-                radius,
-            );
-        }
-    }
-
-    #[test]
-    fn collision_plan_matches_full_grid_scan_across_offsets() {
-        let mut state = 0x0fc0_ffee_1234_5678_u64;
-        let mut next = move || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            state
-        };
-
-        for case in 0..200 {
-            let canvas_width = 64 + (next() % 3) as u32 * 64;
-            let canvas_height = 3 + (next() % 6) as u32;
-            let item_width = 1 + (next() % 130) as u32;
-            let item_height = 1 + (next() % 4) as u32;
-            if item_width > canvas_width || item_height > canvas_height {
-                continue;
-            }
-
-            let mut canvas = BitGrid::new(canvas_width, canvas_height);
-            for index in 0..canvas_width * canvas_height {
-                if next() % 3 == 0 {
-                    canvas.set(index % canvas_width, index / canvas_width);
-                }
-            }
-            let mut item = BitGrid::new(item_width, item_height);
-            for index in 0..item_width * item_height {
-                if next() % 2 == 0 {
-                    item.set(index % item_width, index / item_width);
-                }
-            }
-
-            let plan = item.collision_plan();
-            for y in 0..=canvas_height - item_height {
-                for x in 0..=canvas_width - item_width {
-                    assert_eq!(
-                        canvas.collides_with_plan(&plan, x, y),
-                        canvas.collides_in_bounds(&item, x, y),
-                        "case {case} at ({x}, {y})"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -682,5 +442,80 @@ mod tests {
         assert_eq!(rotated.width, original.width);
         assert_eq!(rotated.height, original.height);
         assert_eq!(rotated.alpha, original.alpha);
+    }
+
+    #[test]
+    fn free_windows_matches_a_pixel_oracle() {
+        for canvas_width in [7_u32, 8, 63, 64, 65] {
+            for canvas_height in [3_u32, 5] {
+                let mut canvas = BitGrid::new(canvas_width, canvas_height);
+                for y in 0..canvas_height {
+                    for x in 0..canvas_width {
+                        if (x.wrapping_mul(13) + y * 7) % 5 == 0 {
+                            canvas.set(x, y);
+                        }
+                    }
+                }
+                for window_width in [1_u32, 2, 3, 5, canvas_width] {
+                    for window_height in [1_u32, 2, 3, canvas_height] {
+                        if window_width > canvas_width || window_height > canvas_height {
+                            continue;
+                        }
+                        let actual = canvas.free_windows(window_width, window_height).unwrap();
+                        assert_eq!(
+                            (actual.width(), actual.height()),
+                            (
+                                canvas_width - window_width + 1,
+                                canvas_height - window_height + 1
+                            )
+                        );
+                        for y in 0..actual.height() {
+                            for x in 0..actual.width() {
+                                let mut free = true;
+                                'window: for dy in 0..window_height {
+                                    for dx in 0..window_width {
+                                        if canvas.get(x + dx, y + dy) {
+                                            free = false;
+                                            break 'window;
+                                        }
+                                    }
+                                }
+                                assert_eq!(
+                                    actual.get(x, y),
+                                    free,
+                                    "canvas {canvas_width}x{canvas_height} window \
+                                     {window_width}x{window_height} at ({x}, {y})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(BitGrid::new(8, 4).free_windows(9, 1).is_none());
+        assert!(BitGrid::new(8, 4).free_windows(1, 5).is_none());
+        assert!(BitGrid::new(8, 4).free_windows(0, 1).is_none());
+    }
+
+    #[test]
+    fn popcount_and_select_set_walk_row_major_order() {
+        let mut grid = BitGrid::new(70, 3);
+        let expected = [
+            (0_u32, 0_u32),
+            (63, 0),
+            (64, 0),
+            (69, 0),
+            (5, 2),
+            (70 - 1, 2),
+        ];
+        for (x, y) in expected {
+            grid.set(x, y);
+        }
+        assert_eq!(grid.popcount(), expected.len() as u64);
+        for (goal, position) in expected.iter().enumerate() {
+            assert_eq!(grid.select_set(goal as u64), Some(*position));
+        }
+        assert_eq!(grid.select_set(expected.len() as u64), None);
+        assert_eq!(BitGrid::new(4, 4).select_set(0), None);
     }
 }

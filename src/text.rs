@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use ab_glyph::{point, Font, FontArc, Glyph, GlyphId, PxScale, ScaleFont};
 
@@ -352,19 +352,26 @@ impl Default for TextRasterizer {
 }
 
 struct GlyphRasterCache {
-    entries: HashMap<(GlyphId, u32), CachedGlyph>,
-    /// Insertion order of `entries`, for first-in-first-out eviction.
-    order: VecDeque<(GlyphId, u32)>,
+    entries: HashMap<(GlyphId, u32), CachedGlyphEntry>,
+    /// Increments on every hit or insert, so the largest tick is the most
+    /// recent access and eviction removes the smallest.
+    tick: u64,
     capacity_bytes: usize,
     max_entries: usize,
     used_bytes: usize,
+}
+
+/// A cached glyph paired with the tick of its last access.
+struct CachedGlyphEntry {
+    glyph: CachedGlyph,
+    last_used: u64,
 }
 
 impl GlyphRasterCache {
     fn new(capacity_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            order: VecDeque::new(),
+            tick: 0,
             capacity_bytes,
             max_entries: DEFAULT_GLYPH_CACHE_MAX_ENTRIES,
             used_bytes: 0,
@@ -382,8 +389,10 @@ impl GlyphRasterCache {
         use_glyph: impl FnOnce(&CachedGlyph) -> R,
     ) -> Option<R> {
         let key = (id, font_size.to_bits());
-        if let Some(cached) = self.entries.get(&key) {
-            return Some(use_glyph(cached));
+        self.tick += 1;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used = self.tick;
+            return Some(use_glyph(&entry.glyph));
         }
 
         let rasterized = rasterize_glyph(font, id, font_size)?;
@@ -392,28 +401,41 @@ impl GlyphRasterCache {
             return Some(use_glyph(&rasterized));
         }
 
-        // Evict oldest-first until the new glyph fits. Clearing everything
-        // instead would throw away the current word's glyphs between the
-        // placement search and the final rasterization, forcing every placed
-        // word to be rasterized twice.
+        // Evict least-recently-used first until the new glyph fits.
+        // Clearing everything instead would throw away the current word's
+        // glyphs between the placement search and the final rasterization,
+        // forcing every placed word to be rasterized twice.
         while self.entries.len() >= self.max_entries
             || self.used_bytes > self.capacity_bytes - allocation_bytes
         {
-            let Some(oldest) = self.order.pop_front() else {
+            let evicted = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key);
+            let Some(evicted) = evicted else {
                 break;
             };
-            if let Some(removed) = self.entries.remove(&oldest) {
-                self.used_bytes -= removed.coverage.capacity();
+            if let Some(removed) = self.entries.remove(&evicted) {
+                self.used_bytes -= removed.glyph.coverage.capacity();
             }
         }
         self.used_bytes += allocation_bytes;
-        self.entries.insert(key, rasterized);
-        self.order.push_back(key);
+        let tick = self.tick;
+        self.entries.insert(
+            key,
+            CachedGlyphEntry {
+                glyph: rasterized,
+                last_used: tick,
+            },
+        );
         debug_assert!(self.used_bytes <= self.capacity_bytes);
         Some(use_glyph(
-            self.entries
+            &self
+                .entries
                 .get(&key)
-                .expect("inserted glyph must be cached"),
+                .expect("inserted glyph must be cached")
+                .glyph,
         ))
     }
 }
@@ -626,16 +648,63 @@ mod tests {
                     .glyph_cache
                     .entries
                     .values()
-                    .map(|glyph| glyph.coverage.capacity())
+                    .map(|entry| entry.glyph.coverage.capacity())
                     .sum::<usize>()
             );
-            // The eviction queue lists every cached key exactly once.
-            assert_eq!(rasterizer.glyph_cache.order.len(), rasterizer.glyph_cache.entries.len());
-            for key in &rasterizer.glyph_cache.order {
-                assert!(rasterizer.glyph_cache.entries.contains_key(key));
-            }
+            // Every entry was last touched within the observed tick range.
+            assert!(rasterizer
+                .glyph_cache
+                .entries
+                .values()
+                .all(|entry| entry.last_used <= rasterizer.glyph_cache.tick));
         }
         assert!(!rasterizer.glyph_cache.entries.is_empty());
+    }
+
+    #[test]
+    fn glyph_cache_evicts_least_recently_used_entry() {
+        let font = test_font();
+
+        // Measure the glyph allocations of two wide letters and one narrow
+        // letter, then size a cache to exactly the two wide ones.
+        let mut measuring = TextRasterizer::with_glyph_cache_capacity(usize::MAX);
+        for word in ["w", "m", "i"] {
+            measuring
+                .rasterize_word(&font, word, 12.0, 500, 240)
+                .unwrap();
+        }
+        let size_of = |character: char| {
+            measuring
+                .glyph_cache
+                .entries
+                .get(&(font.glyph_id(character), 12.0_f32.to_bits()))
+                .map(|entry| entry.glyph.coverage.capacity())
+                .expect("glyph must have been cached")
+        };
+        let capacity = size_of('w') + size_of('m');
+        assert!(
+            size_of('i') < size_of('m'),
+            "the narrow glyph must fit after evicting a single wide glyph"
+        );
+
+        let mut rasterizer = TextRasterizer::with_glyph_cache_capacity(capacity);
+        rasterizer
+            .rasterize_word(&font, "wm", 12.0, 500, 240)
+            .unwrap();
+        // Touch `w` so `m` becomes the least recently used entry.
+        rasterizer
+            .rasterize_word(&font, "w", 12.0, 500, 240)
+            .unwrap();
+        // Caching `i` must evict `m`, not the recently touched `w` (which
+        // first-in-first-out eviction would have removed).
+        rasterizer
+            .rasterize_word(&font, "i", 12.0, 500, 240)
+            .unwrap();
+
+        let entries = &rasterizer.glyph_cache.entries;
+        assert!(entries.contains_key(&(font.glyph_id('w'), 12.0_f32.to_bits())));
+        assert!(entries.contains_key(&(font.glyph_id('i'), 12.0_f32.to_bits())));
+        assert!(!entries.contains_key(&(font.glyph_id('m'), 12.0_f32.to_bits())));
     }
 
     #[test]

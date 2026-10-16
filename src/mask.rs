@@ -1,9 +1,7 @@
 use image::{DynamicImage, GrayImage};
 
 use crate::bitmap::BitGrid;
-use crate::{Result, WordCloudError};
-
-const MAX_MASK_PIXELS: u64 = 16_000_000;
+use crate::{Result, WordCloudError, MAX_CANVAS_PIXELS};
 
 /// Determines which side of a grayscale threshold is blocked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +67,7 @@ impl Mask {
             ));
         }
         let pixels = u64::from(width) * u64::from(height);
-        if pixels > MAX_MASK_PIXELS {
+        if pixels > MAX_CANVAS_PIXELS {
             return Err(WordCloudError::CanvasTooLarge { width, height });
         }
         let mut allowed = BitGrid::new(width, height);

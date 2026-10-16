@@ -5,3 +5,6 @@
 __pycache__/
 /wordcloud.png
 /wordcloud-zh.png
+/wordcloud-article.png
+/wordcloud-chinese.png
+/wordcloud-jieba.png

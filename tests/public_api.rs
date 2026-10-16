@@ -82,7 +82,9 @@ fn text_stopwords_and_case_are_applied() {
     let words = cloud
         .word_frequencies("Rust RUST rust and AND cloud")
         .unwrap();
-    assert_eq!(words[0].word, "rust");
+    // Case variants fuse into the most frequent capitalization; ties keep
+    // the first-seen variant, like the Python package.
+    assert_eq!(words[0].word, "Rust");
     assert_eq!(words[0].frequency, 3.0);
     assert_eq!(words.len(), 2);
     assert!(!words.iter().any(|word| word.word == "and"));
@@ -377,9 +379,7 @@ fn repeat_pads_with_downweighted_duplicate_words() {
         .map(|word| word.frequency)
         .collect();
     assert!(rust_frequencies.len() >= 2);
-    assert!(rust_frequencies
-        .windows(2)
-        .all(|pair| pair[0] > pair[1]));
+    assert!(rust_frequencies.windows(2).all(|pair| pair[0] > pair[1]));
     // Repeated words never render larger than their first occurrence.
     for word in repeated.words() {
         let first_font_size = repeated

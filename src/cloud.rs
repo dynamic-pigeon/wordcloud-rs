@@ -1,28 +1,33 @@
-use std::borrow::Cow;
-use std::collections::HashMap;
+use std::cmp::Ordering;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ab_glyph::{CodepointIdIter, Font, FontArc, FontRef, FontVec, GlyphId, InvalidFont, Outline};
 use image::{DynamicImage, ImageFormat, Pixel, Rgba, RgbaImage};
 
-use crate::bitmap::{AlphaBitmap, BitGrid, CollisionPlan};
+use crate::bitmap::{AlphaBitmap, BitGrid};
 use crate::color::{ColorContext, Colorizer, Palette, SolidColor};
-use crate::frequency::{collect_frequencies, sort_frequencies, IntoWordFrequency, WordFrequency};
+use crate::frequency::{
+    collect_frequencies, process_tokens, sort_frequencies, unigrams_and_bigrams, IntoWordFrequency,
+    WordFrequency,
+};
 use crate::mask::Mask;
 use crate::text::{supports_word, TextRasterizer};
 use crate::tokenizer::{DefaultTokenizer, StopWords, Tokenizer};
-use crate::{Result, WordCloudError};
+use crate::{Result, WordCloudError, MAX_CANVAS_PIXELS};
 
 const DEFAULT_FONT: &[u8] = include_bytes!("../assets/OpenSans-Regular.ttf");
 const DEFAULT_WIDTH: u32 = 400;
 const DEFAULT_HEIGHT: u32 = 200;
-const MAX_OUTPUT_PIXELS: u64 = 16_000_000;
 const MAX_WORD_LENGTH_LIMIT: usize = 4_096;
+/// Default Dunning log-likelihood threshold for bigram collocations, from
+/// the Python package.
+const DEFAULT_COLLOCATION_THRESHOLD: f64 = 30.0;
 static DEFAULT_SEED_BASE: OnceLock<u64> = OnceLock::new();
 static DEFAULT_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -34,7 +39,7 @@ fn default_random_seed() -> u64 {
             .as_nanos() as u64;
         timestamp ^ u64::from(std::process::id()).rotate_left(32)
     });
-    let sequence = DEFAULT_SEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = DEFAULT_SEED_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
     let mut value = base.wrapping_add(sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -90,6 +95,9 @@ pub struct PlacedWord {
     pub word: String,
     pub frequency: f64,
     pub normalized_frequency: f32,
+    /// Zero-based position in the descending-frequency input list. Words
+    /// dropped before placement (stopwords, unsupported glyphs) leave gaps,
+    /// and `repeat` duplicates keep the rank of the word they repeat.
     pub rank: usize,
     pub x: u32,
     pub y: u32,
@@ -135,8 +143,12 @@ impl RenderedWordCloud {
                 // YCbCr, so encoding straight from the RGBA buffer avoids
                 // materializing a full-size RGB copy.
                 let file = fs::File::create(path).map_err(image::ImageError::IoError)?;
-                let mut encoder = image::codecs::jpeg::JpegEncoder::new(io::BufWriter::new(file));
+                let mut writer = io::BufWriter::new(file);
+                let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut writer);
                 encoder.encode_image(&self.image)?;
+                // Dropping a `BufWriter` ignores flush errors, which would
+                // silently leave a truncated file behind on a full disk.
+                writer.flush().map_err(image::ImageError::IoError)?;
             }
             _ => self.image.save_with_format(path, format)?,
         }
@@ -156,7 +168,8 @@ pub struct WordCloudBuilder {
     font_step: f32,
     margin: u32,
     prefer_horizontal: f32,
-    relative_scaling: f32,
+    /// `None` selects the Python `relative_scaling="auto"` rule.
+    relative_scaling: Option<f32>,
     random_seed: Option<u64>,
     background_color: Rgba<u8>,
     font_source: FontSource,
@@ -167,7 +180,9 @@ pub struct WordCloudBuilder {
     include_numbers: bool,
     min_word_length: usize,
     max_word_length: usize,
-    search_attempts: usize,
+    collocations: bool,
+    collocation_threshold: f64,
+    normalize_plurals: bool,
     colorizer: Arc<dyn Colorizer>,
     colorizer_valid: bool,
 }
@@ -182,21 +197,23 @@ impl Default for WordCloudBuilder {
             repeat: false,
             min_font_size: 4.0,
             max_font_size: None,
-            font_step: 2.0,
+            font_step: 1.0,
             margin: 2,
             prefer_horizontal: 0.9,
-            relative_scaling: 0.5,
+            relative_scaling: None,
             random_seed: None,
-            background_color: Rgba([255, 255, 255, 255]),
+            background_color: Rgba([0, 0, 0, 255]),
             font_source: FontSource::default(),
             mask: None,
             tokenizer: Arc::new(DefaultTokenizer),
             stopwords: StopWords::default(),
-            lowercase: true,
+            lowercase: false,
             include_numbers: false,
-            min_word_length: 1,
+            min_word_length: 0,
             max_word_length: 256,
-            search_attempts: 1_200,
+            collocations: true,
+            collocation_threshold: DEFAULT_COLLOCATION_THRESHOLD,
+            normalize_plurals: true,
             colorizer: Arc::new(Palette::default()),
             colorizer_valid: true,
         }
@@ -241,7 +258,8 @@ impl WordCloudBuilder {
     /// Each repetition round multiplies the original frequencies by the
     /// smallest normalized frequency (minimum divided by maximum), matching
     /// the `repeat` option of the Python `wordcloud` package. Repeated words
-    /// therefore render progressively smaller. Disabled by default.
+    /// therefore render progressively smaller, and each duplicate keeps the
+    /// rank of the word it repeats. Disabled by default.
     pub fn repeat(mut self, repeat: bool) -> Self {
         self.repeat = repeat;
         self
@@ -257,6 +275,8 @@ impl WordCloudBuilder {
         self
     }
 
+    /// Restores the Python auto-fit behavior: the largest font size is
+    /// derived per generation by probing the top two words at canvas height.
     pub fn auto_max_font_size(mut self) -> Self {
         self.max_font_size = None;
         self
@@ -277,8 +297,18 @@ impl WordCloudBuilder {
         self
     }
 
+    /// Sets how strongly frequency ratios drive font sizes.
+    ///
+    /// Without an explicit value the Python `"auto"` rule applies: `0.5`
+    /// normally and `0.0` when `repeat` is enabled.
     pub fn relative_scaling(mut self, relative_scaling: f32) -> Self {
-        self.relative_scaling = relative_scaling;
+        self.relative_scaling = Some(relative_scaling);
+        self
+    }
+
+    /// Restores the Python `relative_scaling="auto"` behavior.
+    pub fn auto_relative_scaling(mut self) -> Self {
+        self.relative_scaling = None;
         self
     }
 
@@ -388,6 +418,10 @@ impl WordCloudBuilder {
         self
     }
 
+    /// Lowercases every token before counting, so `"Rust"` and `"rust"`
+    /// always merge as `"rust"`. Disabled by default; without it, words are
+    /// represented by their most frequent capitalization, like the Python
+    /// package.
     pub fn lowercase(mut self, lowercase: bool) -> Self {
         self.lowercase = lowercase;
         self
@@ -409,9 +443,28 @@ impl WordCloudBuilder {
         self
     }
 
-    /// Maximum candidate positions checked for each orientation and font size.
-    pub fn search_attempts(mut self, attempts: usize) -> Self {
-        self.search_attempts = attempts;
+    /// Detects two-word collocations (bigrams) among adjacent tokens and
+    /// promotes statistically significant pairs to single words, like the
+    /// Python package's `collocations` option. Enabled by default; only
+    /// affects natural-text input.
+    pub fn collocations(mut self, collocations: bool) -> Self {
+        self.collocations = collocations;
+        self
+    }
+
+    /// Minimum Dunning log-likelihood score for a bigram to count as a
+    /// collocation. Defaults to 30, the Python package's value.
+    pub fn collocation_threshold(mut self, threshold: f64) -> Self {
+        self.collocation_threshold = threshold;
+        self
+    }
+
+    /// Merges trailing-`s` plurals into their singular when both forms
+    /// appear (except words ending in `ss`), like the Python package's
+    /// `normalize_plurals` option. Enabled by default; only affects
+    /// natural-text input.
+    pub fn normalize_plurals(mut self, normalize: bool) -> Self {
+        self.normalize_plurals = normalize;
         self
     }
 
@@ -461,14 +514,10 @@ impl WordCloudBuilder {
             }
         }
         validate_probability("prefer_horizontal", self.prefer_horizontal)?;
-        validate_probability("relative_scaling", self.relative_scaling)?;
-        if self.min_word_length == 0 {
-            return Err(WordCloudError::invalid(
-                "min_word_length",
-                "must be at least 1",
-            ));
+        if let Some(relative_scaling) = self.relative_scaling {
+            validate_probability("relative_scaling", relative_scaling)?;
         }
-        if self.max_word_length < self.min_word_length
+        if self.min_word_length > self.max_word_length
             || self.max_word_length > MAX_WORD_LENGTH_LIMIT
         {
             return Err(WordCloudError::invalid(
@@ -476,10 +525,10 @@ impl WordCloudBuilder {
                 format!("must be between min_word_length and {MAX_WORD_LENGTH_LIMIT}"),
             ));
         }
-        if self.search_attempts == 0 {
+        if !self.collocation_threshold.is_finite() || self.collocation_threshold < 0.0 {
             return Err(WordCloudError::invalid(
-                "search_attempts",
-                "must be at least 1",
+                "collocation_threshold",
+                "must be finite and non-negative",
             ));
         }
         if !self.colorizer_valid {
@@ -504,7 +553,7 @@ impl WordCloudBuilder {
                     height: logical_height,
                 })?;
         let pixels = u64::from(width) * u64::from(height);
-        if pixels > MAX_OUTPUT_PIXELS {
+        if pixels > MAX_CANVAS_PIXELS {
             return Err(WordCloudError::CanvasTooLarge { width, height });
         }
         let margin = self
@@ -519,12 +568,7 @@ impl WordCloudBuilder {
         }
 
         let font = load_font(&self.font_source)?;
-        let maximum = self
-            .max_font_size
-            .unwrap_or(logical_height as f32 * 0.5)
-            .max(self.min_font_size);
         let min_font_size = scale_font_size("min_font_size", self.min_font_size, self.scale)?;
-        let requested_max_font_size = scale_font_size("max_font_size", maximum, self.scale)?;
         let canvas_font_limit = width.max(height) as f32;
         if min_font_size > canvas_font_limit {
             return Err(WordCloudError::invalid(
@@ -532,14 +576,26 @@ impl WordCloudBuilder {
                 "must not exceed the longest canvas dimension",
             ));
         }
-        let max_font_size = requested_max_font_size.min(canvas_font_limit);
+        // `None` keeps the Python auto-fit: the maximum is derived per
+        // generation by probing the top two words at canvas height.
+        let max_font_size = match self.max_font_size {
+            Some(maximum) => {
+                let scaled = scale_font_size("max_font_size", maximum, self.scale)?;
+                let clamped = scaled.min(canvas_font_limit);
+                if clamped > min_font_size && clamped - self.font_step >= clamped {
+                    return Err(WordCloudError::invalid(
+                        "font_step",
+                        "is too small to reduce max_font_size at f32 precision",
+                    ));
+                }
+                Some(clamped)
+            }
+            None => None,
+        };
         let font_step = scale_font_size("font_step", self.font_step, self.scale)?;
-        if max_font_size > min_font_size && max_font_size - font_step >= max_font_size {
-            return Err(WordCloudError::invalid(
-                "font_step",
-                "is too small to reduce max_font_size at f32 precision",
-            ));
-        }
+        let relative_scaling = self
+            .relative_scaling
+            .unwrap_or(if self.repeat { 0.0 } else { 0.5 });
         let mask_blocked = self
             .mask
             .as_ref()
@@ -556,7 +612,7 @@ impl WordCloudBuilder {
             font_step,
             margin,
             prefer_horizontal: self.prefer_horizontal,
-            relative_scaling: self.relative_scaling,
+            relative_scaling,
             random_seed: self.random_seed,
             background_color: self.background_color,
             font,
@@ -567,7 +623,9 @@ impl WordCloudBuilder {
             include_numbers: self.include_numbers,
             min_word_length: self.min_word_length,
             max_word_length: self.max_word_length,
-            search_attempts: self.search_attempts,
+            collocations: self.collocations,
+            collocation_threshold: self.collocation_threshold,
+            normalize_plurals: self.normalize_plurals,
             colorizer: self.colorizer,
         })
     }
@@ -582,7 +640,8 @@ pub struct WordCloud {
     max_words: usize,
     repeat: bool,
     min_font_size: f32,
-    max_font_size: f32,
+    /// `None` triggers the per-generation auto-fit probe.
+    max_font_size: Option<f32>,
     font_step: f32,
     margin: u32,
     prefer_horizontal: f32,
@@ -600,7 +659,9 @@ pub struct WordCloud {
     include_numbers: bool,
     min_word_length: usize,
     max_word_length: usize,
-    search_attempts: usize,
+    collocations: bool,
+    collocation_threshold: f64,
+    normalize_plurals: bool,
     colorizer: Arc<dyn Colorizer>,
 }
 
@@ -626,7 +687,7 @@ impl WordCloud {
     }
 
     pub fn word_frequencies(&self, text: &str) -> Result<Vec<WordFrequency>> {
-        let mut counts = HashMap::<String, u64>::new();
+        let mut words: Vec<String> = Vec::new();
         let mut invalid = None;
         self.tokenizer.for_each_token(text, &mut |candidate| {
             if invalid.is_some() {
@@ -636,39 +697,49 @@ impl WordCloud {
             if candidate.is_empty() {
                 return;
             }
-            let word: Cow<'_, str> = if self.lowercase {
-                Cow::Owned(candidate.to_lowercase())
-            } else {
-                Cow::Borrowed(candidate)
-            };
+            // Trailing "'s" is stripped before any other filter, like
+            // process_text of the Python package.
+            let word = strip_possessive(candidate);
+            if !self.include_numbers && word.chars().all(|character| character.is_numeric()) {
+                return;
+            }
             let word_length = word.chars().count();
+            if word_length < self.min_word_length {
+                return;
+            }
             if word_length > self.max_word_length {
                 invalid = Some(WordCloudError::InvalidWord {
-                    word: word.into_owned(),
+                    word: word.to_owned(),
                     reason: format!("exceeds max_word_length ({})", self.max_word_length),
                 });
                 return;
             }
-            if word_length < self.min_word_length
-                || self.is_stopword(&word)
-                || (!self.include_numbers
-                    && word
-                        .chars()
-                        .filter(|character| !character.is_whitespace())
-                        .all(|character| character.is_numeric()))
-            {
-                return;
-            }
-            // Only first-time words allocate a key; repeats borrow.
-            if let Some(count) = counts.get_mut(word.as_ref()) {
-                *count += 1;
+            // Tokens are kept in order, including repeats: bigram
+            // collocations are built from adjacent tokens.
+            words.push(if self.lowercase {
+                word.to_lowercase()
             } else {
-                counts.insert(word.into_owned(), 1);
-            }
+                word.to_owned()
+            });
         });
         if let Some(error) = invalid {
             return Err(error);
         }
+        let counts = if self.collocations {
+            unigrams_and_bigrams(
+                words,
+                &self.stopwords,
+                self.normalize_plurals,
+                self.collocation_threshold,
+            )
+        } else {
+            let filtered: Vec<String> = words
+                .iter()
+                .filter(|word| !self.is_stopword(word))
+                .cloned()
+                .collect();
+            process_tokens(&filtered, self.normalize_plurals).counts
+        };
         if counts.is_empty() {
             return Err(WordCloudError::EmptyInput);
         }
@@ -770,170 +841,49 @@ impl WordCloud {
 
         let max_frequency = renderable[0].1.frequency;
         let attempted = renderable.len();
-        let mut occupied = self.initial_occupancy();
-        let mut text_rasterizer = TextRasterizer::new();
         let random_seed = self.random_seed.unwrap_or_else(default_random_seed);
         let mut layout_rng = StableRng::new(random_seed ^ 0x4c41_594f_5554_5f31);
         let mut color_rng = StableRng::new(random_seed ^ 0x434f_4c4f_5253_5f31);
-        let mut placed = Vec::<PlacedWord>::new();
-        let mut image = None;
-        let mut previous: Option<(f64, f32)> = None;
+        let mut text_rasterizer = TextRasterizer::new();
 
-        for (rank, frequency) in renderable {
-            let normalized_frequency = (frequency.frequency / max_frequency) as f32;
-            let target_size = previous
-                .map(|(previous_frequency, previous_size)| {
-                    let ratio = (frequency.frequency / previous_frequency) as f32;
-                    previous_size * ((1.0 - self.relative_scaling) + self.relative_scaling * ratio)
-                })
-                .unwrap_or(self.max_font_size)
-                .clamp(self.min_font_size, self.max_font_size);
-            let (orientations, orientation_count) = self.orientation_order(&mut layout_rng);
-            let mut font_size = target_size.floor().max(self.min_font_size);
-            let mut selected = None;
-            let usable_width = self.width - self.margin * 2;
-            let usable_height = self.height - self.margin * 2;
-
-            // Placement is searched with compact ink masks only; the full
-            // coverage bitmap is materialized once a position is selected.
-            loop {
-                if let Some(horizontal_ink) = text_rasterizer.word_ink(
-                    &self.font,
-                    &frequency.word,
-                    font_size,
-                    usable_width,
-                    usable_height,
-                ) {
-                    let mut horizontal_ink = Some(horizontal_ink);
-                    for orientation in orientations[..orientation_count].iter().copied() {
-                        match orientation {
-                            Orientation::Horizontal => {
-                                let ink = horizontal_ink
-                                    .as_ref()
-                                    .expect("horizontal ink must be available");
-                                if let Some((x, y)) = find_ink_position(
-                                    &occupied,
-                                    ink,
-                                    self.margin,
-                                    self.width,
-                                    self.height,
-                                    self.search_attempts,
-                                    &mut layout_rng,
-                                ) {
-                                    selected = Some((
-                                        horizontal_ink
-                                            .take()
-                                            .expect("selected horizontal ink must be available"),
-                                        orientation,
-                                        x,
-                                        y,
-                                    ));
-                                    break;
-                                }
-                            }
-                            Orientation::Vertical => {
-                                let ink = horizontal_ink
-                                    .as_ref()
-                                    .expect("horizontal ink must be available");
-                                if !bitmap_fits_with_margin(
-                                    ink.height(),
-                                    ink.width(),
-                                    self.margin,
-                                    self.width,
-                                    self.height,
-                                ) {
-                                    continue;
-                                }
-                                let ink = ink.rotate_clockwise();
-                                if let Some((x, y)) = find_ink_position(
-                                    &occupied,
-                                    &ink,
-                                    self.margin,
-                                    self.width,
-                                    self.height,
-                                    self.search_attempts,
-                                    &mut layout_rng,
-                                ) {
-                                    selected = Some((ink, orientation, x, y));
-                                    break;
-                                }
-                            }
-                        }
+        // Python auto-fit: with a single word, go as big as the canvas
+        // height; otherwise place the top two words at canvas height and
+        // start from the harmonic mean of their fitted sizes.
+        let start_font_size = match self.max_font_size {
+            Some(max) => max,
+            None if renderable.len() == 1 => self.height as f32,
+            None => {
+                let (sizes, _, _) = self.place_words(
+                    &renderable[..2],
+                    self.height as f32,
+                    max_frequency,
+                    &mut layout_rng,
+                    &mut color_rng,
+                    &mut text_rasterizer,
+                    false,
+                )?;
+                match (sizes.first(), sizes.get(1)) {
+                    (Some(&first), Some(&second)) => {
+                        ((2.0 * f64::from(first) * f64::from(second)) / f64::from(first + second))
+                            as f32
+                    }
+                    (Some(&only), None) => only,
+                    (None, _) => {
+                        return Err(WordCloudError::NoWordsPlaced { attempted });
                     }
                 }
-                if selected.is_some() || font_size <= self.min_font_size {
-                    break;
-                }
-                font_size = next_font_size(font_size, self.font_step, self.min_font_size);
             }
+        };
 
-            let Some((ink, orientation, x, y)) = selected else {
-                continue;
-            };
-            let bitmap = match orientation {
-                Orientation::Horizontal => {
-                    let Some(bitmap) = text_rasterizer.rasterize_word(
-                        &self.font,
-                        &frequency.word,
-                        font_size,
-                        usable_width,
-                        usable_height,
-                    ) else {
-                        continue;
-                    };
-                    bitmap
-                }
-                Orientation::Vertical => {
-                    // Rasterize straight into rotated coordinates: the
-                    // horizontal buffer would otherwise exist only to be
-                    // rotated, holding two `width * height` buffers at once.
-                    let Some(bitmap) = text_rasterizer.rasterize_word_rotated(
-                        &self.font,
-                        &frequency.word,
-                        font_size,
-                        usable_width,
-                        usable_height,
-                    ) else {
-                        continue;
-                    };
-                    bitmap
-                }
-            };
-            if !occupied.insert(&ink, x, y) {
-                continue;
-            }
-            let random = color_rng.unit_f32();
-            let color = self.colorizer.color(&ColorContext {
-                word: &frequency.word,
-                frequency: frequency.frequency,
-                normalized_frequency,
-                rank,
-                font_size,
-                orientation,
-                x,
-                y,
-                random,
-            });
-            let metadata = PlacedWord {
-                word: frequency.word,
-                frequency: frequency.frequency,
-                normalized_frequency,
-                rank,
-                x,
-                y,
-                width: bitmap.width,
-                height: bitmap.height,
-                font_size,
-                orientation,
-                color,
-            };
-            let image = image.get_or_insert_with(|| {
-                RgbaImage::from_pixel(self.width, self.height, self.background_color)
-            });
-            blend_bitmap(image, &bitmap, &metadata);
-            placed.push(metadata);
-            previous = Some((frequency.frequency, font_size));
-        }
+        let (_, placed, image) = self.place_words(
+            &renderable,
+            start_font_size,
+            max_frequency,
+            &mut layout_rng,
+            &mut color_rng,
+            &mut text_rasterizer,
+            true,
+        )?;
 
         if placed.is_empty() {
             return Err(WordCloudError::NoWordsPlaced { attempted });
@@ -945,6 +895,165 @@ impl WordCloud {
         })
     }
 
+    /// Runs the placement ladder over `words`, starting every generation at
+    /// `start_font_size`. Returns the placed font sizes in order, the
+    /// placement metadata (empty when `collect` is false, used for the
+    /// auto-fit probe), and the blended image when `collect` is true.
+    #[allow(clippy::too_many_arguments)]
+    fn place_words(
+        &self,
+        words: &[(usize, WordFrequency)],
+        start_font_size: f32,
+        max_frequency: f64,
+        layout_rng: &mut StableRng,
+        color_rng: &mut StableRng,
+        text_rasterizer: &mut TextRasterizer,
+        collect: bool,
+    ) -> Result<(Vec<f32>, Vec<PlacedWord>, Option<RgbaImage>)> {
+        let clearance = self.margin / 2;
+        let mut font_size = start_font_size;
+        // The scaling formula works on the ratio to the last placed word's
+        // frequency, normalized like the Python package.
+        let mut last_frequency = 1.0_f64;
+        let mut placed_sizes = Vec::new();
+        let mut placed = Vec::new();
+        let mut image: Option<RgbaImage> = None;
+        let mut occupied = self.initial_occupancy();
+
+        'words: for &(rank, ref frequency) in words {
+            let normalized = frequency.frequency / max_frequency;
+            if self.relative_scaling != 0.0 {
+                font_size = round_half_even(
+                    (f64::from(self.relative_scaling) * (normalized / last_frequency)
+                        + f64::from(1.0 - self.relative_scaling))
+                        * f64::from(font_size),
+                ) as f32;
+            }
+
+            // The orientation roll is drawn before the size ladder, matching
+            // the reference implementation's RNG stream shape.
+            let mut orientation = if layout_rng.unit_f32() < self.prefer_horizontal {
+                Orientation::Horizontal
+            } else {
+                Orientation::Vertical
+            };
+            let mut tried_other_orientation = false;
+            let mut selected = None;
+
+            loop {
+                if font_size < self.min_font_size {
+                    break;
+                }
+                if let Some(ink) = text_rasterizer.word_ink(
+                    &self.font,
+                    &frequency.word,
+                    font_size,
+                    self.width,
+                    self.height,
+                ) {
+                    let (window_width, window_height) = match orientation {
+                        Orientation::Horizontal => {
+                            (ink.width() + 2 * clearance, ink.height() + 2 * clearance)
+                        }
+                        Orientation::Vertical => {
+                            (ink.height() + 2 * clearance, ink.width() + 2 * clearance)
+                        }
+                    };
+                    if let Some((x, y)) =
+                        sample_position(&occupied, window_width, window_height, layout_rng)
+                    {
+                        let x = x + clearance;
+                        let y = y + clearance;
+                        let ink = match orientation {
+                            Orientation::Horizontal => ink,
+                            Orientation::Vertical => ink.rotate_clockwise(),
+                        };
+                        let inserted = occupied.insert(&ink, x, y);
+                        debug_assert!(inserted);
+                        selected = Some((orientation, x, y, font_size));
+                        break;
+                    }
+                }
+                if !tried_other_orientation && self.prefer_horizontal < 1.0 {
+                    tried_other_orientation = true;
+                    if orientation != Orientation::Vertical {
+                        orientation = Orientation::Vertical;
+                        // Retry the same font size, rotated.
+                        continue;
+                    }
+                    // The reference retries the identical vertical query
+                    // here; skipping the duplicate is observationally
+                    // equivalent.
+                }
+                font_size -= self.font_step;
+                orientation = Orientation::Horizontal;
+            }
+
+            let Some((orientation, x, y, placed_size)) = selected else {
+                // Like the Python package, stop placing entirely once a word
+                // no longer fits at the minimum font size.
+                break 'words;
+            };
+
+            placed_sizes.push(placed_size);
+            last_frequency = normalized;
+            if !collect {
+                continue;
+            }
+            let bitmap = match orientation {
+                Orientation::Horizontal => text_rasterizer.rasterize_word(
+                    &self.font,
+                    &frequency.word,
+                    placed_size,
+                    self.width,
+                    self.height,
+                ),
+                Orientation::Vertical => text_rasterizer.rasterize_word_rotated(
+                    &self.font,
+                    &frequency.word,
+                    placed_size,
+                    self.width,
+                    self.height,
+                ),
+            };
+            let Some(bitmap) = bitmap else {
+                continue;
+            };
+            let random = color_rng.unit_f32();
+            let color = self.colorizer.color(&ColorContext {
+                word: &frequency.word,
+                frequency: frequency.frequency,
+                normalized_frequency: normalized as f32,
+                rank,
+                font_size: placed_size,
+                orientation,
+                x,
+                y,
+                random,
+            });
+            let metadata = PlacedWord {
+                word: frequency.word.clone(),
+                frequency: frequency.frequency,
+                normalized_frequency: normalized as f32,
+                rank,
+                x,
+                y,
+                width: bitmap.width,
+                height: bitmap.height,
+                font_size: placed_size,
+                orientation,
+                color,
+            };
+            let image = image.get_or_insert_with(|| {
+                RgbaImage::from_pixel(self.width, self.height, self.background_color)
+            });
+            blend_bitmap(image, &bitmap, &metadata);
+            placed.push(metadata);
+        }
+
+        Ok((placed_sizes, placed, image))
+    }
+
     fn initial_occupancy(&self) -> BitGrid {
         // One memcpy per generation keeps collision probes single-grid: a
         // separate immutable mask check measurably doubles the placement
@@ -954,18 +1063,55 @@ impl WordCloud {
             .cloned()
             .unwrap_or_else(|| BitGrid::new(self.width, self.height))
     }
+}
 
-    fn orientation_order(&self, rng: &mut StableRng) -> ([Orientation; 2], usize) {
-        if self.prefer_horizontal >= 1.0 {
-            ([Orientation::Horizontal, Orientation::Vertical], 1)
-        } else if self.prefer_horizontal <= 0.0 {
-            ([Orientation::Vertical, Orientation::Horizontal], 1)
-        } else if rng.unit_f32() < self.prefer_horizontal {
-            ([Orientation::Horizontal, Orientation::Vertical], 2)
-        } else {
-            ([Orientation::Vertical, Orientation::Horizontal], 2)
+/// Removes a trailing `"'s"` possessive, like `process_text` of the Python
+/// package. The check is case-insensitive; the stripped input keeps its
+/// original capitalization.
+fn strip_possessive(word: &str) -> &str {
+    if word.len() >= 2 {
+        let bytes = word.as_bytes();
+        // Only ASCII `s`/`S` lowercases to `s`, so matching bytes directly
+        // is exact and keeps the split below on a char boundary.
+        let last_is_s = matches!(bytes[word.len() - 1], b's' | b'S');
+        let second_is_apostrophe = bytes[word.len() - 2] == b'\'';
+        if last_is_s && second_is_apostrophe {
+            return &word[..word.len() - 2];
         }
     }
+    word
+}
+
+/// Rounds to the nearest integer, halves to even, like Python's `round`
+/// used for font sizes.
+fn round_half_even(value: f64) -> f64 {
+    let floor = value.floor();
+    match (value - floor).partial_cmp(&0.5) {
+        Some(Ordering::Less) => floor,
+        Some(Ordering::Greater) => floor + 1.0,
+        _ if (floor as i64) % 2 == 0 => floor,
+        _ => floor + 1.0,
+    }
+}
+
+/// Picks a uniformly random position where a `width` x `height` window fits
+/// entirely in free space, mirroring `query_integral_image` of the Python
+/// package: every valid position is enumerated and one is chosen at random.
+fn sample_position(
+    occupied: &BitGrid,
+    width: u32,
+    height: u32,
+    rng: &mut StableRng,
+) -> Option<(u32, u32)> {
+    let valid = occupied.free_windows(width, height)?;
+    let total = valid.popcount();
+    if total == 0 {
+        return None;
+    }
+    // Modulo reduction is slightly non-uniform; matching the reference's
+    // behavior does not warrant rejection sampling.
+    let goal = rng.next_u64() % total;
+    valid.select_set(goal)
 }
 
 /// A [`Font`] that borrows its bytes from an [`Arc<[u8]>`] it keeps alive,
@@ -1169,15 +1315,6 @@ fn extend_with_repeats(
     renderable
 }
 
-fn next_font_size(current: f32, step: f32, minimum: f32) -> f32 {
-    let next = current - step;
-    if !next.is_finite() || next >= current || next < minimum {
-        minimum
-    } else {
-        next
-    }
-}
-
 /// Builds a grid marking the pixels the mask forbids, at output scale.
 fn build_mask_blocked(mask: &Mask, width: u32, height: u32, scale: u32) -> BitGrid {
     debug_assert_eq!(width, mask.width() * scale);
@@ -1198,114 +1335,6 @@ fn build_mask_blocked(mask: &Mask, width: u32, height: u32, scale: u32) -> BitGr
         }
     }
     blocked
-}
-
-fn bitmap_fits_with_margin(
-    width: u32,
-    height: u32,
-    margin: u32,
-    canvas_width: u32,
-    canvas_height: u32,
-) -> bool {
-    let Some(padding) = margin.checked_mul(2) else {
-        return false;
-    };
-    width
-        .checked_add(padding)
-        .is_some_and(|width| width <= canvas_width)
-        && height
-            .checked_add(padding)
-            .is_some_and(|height| height <= canvas_height)
-}
-
-fn find_ink_position(
-    occupied: &BitGrid,
-    ink: &BitGrid,
-    margin: u32,
-    canvas_width: u32,
-    canvas_height: u32,
-    attempts: usize,
-    rng: &mut StableRng,
-) -> Option<(u32, u32)> {
-    if !bitmap_fits_with_margin(
-        ink.width(),
-        ink.height(),
-        margin,
-        canvas_width,
-        canvas_height,
-    ) {
-        return None;
-    }
-    let collision = ink.dilated(margin)?;
-    let (collision_x, collision_y) = find_position(occupied, &collision, attempts, rng)?;
-    Some((collision_x + margin, collision_y + margin))
-}
-
-fn find_position(
-    occupied: &BitGrid,
-    candidate: &BitGrid,
-    attempts: usize,
-    rng: &mut StableRng,
-) -> Option<(u32, u32)> {
-    let max_x = occupied.width().checked_sub(candidate.width())?;
-    let max_y = occupied.height().checked_sub(candidate.height())?;
-    // The candidate is fixed across all probes below, so its nonzero words
-    // are compacted once and every probe scans only those.
-    let plan = candidate.collision_plan();
-    // Try a center-biased random position first. This lets the dominant word
-    // move between generations while keeping the composition near the middle.
-    let biased_attempts = attempts.min(96);
-    for _ in 0..biased_attempts {
-        let x = ((u64::from(rng.range_inclusive(max_x)) + u64::from(rng.range_inclusive(max_x)))
-            / 2) as u32;
-        let y = ((u64::from(rng.range_inclusive(max_y)) + u64::from(rng.range_inclusive(max_y)))
-            / 2) as u32;
-        if position_is_free(occupied, &plan, x, y) {
-            return Some((x, y));
-        }
-    }
-
-    // The exact center remains a reliable fallback for sparse random misses
-    // and restrictive masks.
-    let center = (max_x / 2, max_y / 2);
-    if position_is_free(occupied, &plan, center.0, center.1) {
-        return Some(center);
-    }
-
-    let positions_per_row = u64::from(max_x) + 1;
-    let total = positions_per_row * (u64::from(max_y) + 1);
-    let checks = (attempts - biased_attempts).min(total as usize);
-    if checks == 0 {
-        return None;
-    }
-    let start = rng.next_u64() % total;
-    let mut step = (rng.next_u64() % total).max(1);
-    while gcd(step, total) != 1 {
-        step = if step + 1 == total { 1 } else { step + 1 };
-    }
-    let mut index = start;
-    for _ in 0..checks {
-        let x = (index % positions_per_row) as u32;
-        let y = (index / positions_per_row) as u32;
-        if position_is_free(occupied, &plan, x, y) {
-            return Some((x, y));
-        }
-        index = (index + step) % total;
-    }
-    None
-}
-
-fn position_is_free(occupied: &BitGrid, plan: &CollisionPlan, x: u32, y: u32) -> bool {
-    !occupied.collides_with_plan(plan, x, y)
-}
-
-fn gcd(mut left: u64, mut right: u64) -> u64 {
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
-    }
-    left
 }
 
 fn blend_bitmap(image: &mut RgbaImage, bitmap: &AlphaBitmap, word: &PlacedWord) {
@@ -1356,14 +1385,6 @@ impl StableRng {
         let mantissa = (self.next_u64() >> 40) as u32;
         mantissa as f32 / 16_777_216.0
     }
-
-    fn range_inclusive(&mut self, maximum: u32) -> u32 {
-        if maximum == 0 {
-            0
-        } else {
-            (self.next_u64() % (u64::from(maximum) + 1)) as u32
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1378,19 +1399,53 @@ mod tests {
     }
 
     #[test]
-    fn empty_canvas_placement_is_randomized_around_center() {
-        let occupied = BitGrid::new(400, 200);
-        let candidate = BitGrid::new(100, 40);
-        let center = (150, 80);
+    fn round_half_even_matches_python_round() {
+        assert_eq!(round_half_even(62.4), 62.0);
+        assert_eq!(round_half_even(62.6), 63.0);
+        assert_eq!(round_half_even(62.5), 62.0);
+        assert_eq!(round_half_even(63.5), 64.0);
+        assert_eq!(round_half_even(-62.5), -62.0);
+        assert_eq!(round_half_even(64.0), 64.0);
+    }
+
+    #[test]
+    fn strip_possessive_removes_trailing_s() {
+        assert_eq!(strip_possessive("ocean's"), "ocean");
+        assert_eq!(strip_possessive("IT'S"), "IT");
+        assert_eq!(strip_possessive("it"), "it");
+        assert_eq!(strip_possessive("cats'"), "cats'");
+        assert_eq!(strip_possessive("'s"), "");
+    }
+
+    #[test]
+    fn uniform_sampling_returns_only_valid_positions() {
+        let mut occupied = BitGrid::new(100, 50);
+        for y in 10..40 {
+            for x in 40..60 {
+                occupied.set(x, y);
+            }
+        }
         let mut first_rng = StableRng::new(1);
         let mut second_rng = StableRng::new(2);
+        let mut seen_first = None;
+        let mut seen_second = None;
+        for _ in 0..64 {
+            if let Some((x, y)) = sample_position(&occupied, 10, 5, &mut first_rng) {
+                assert!(x <= 90, "{x}");
+                assert!(y <= 45, "{y}");
+                // The window must not touch the blocked rectangle.
+                assert!(x + 10 <= 40 || x >= 60 || y + 5 <= 10 || y >= 40);
+                seen_first = Some((x, y));
+            }
+            if let Some(position) = sample_position(&occupied, 10, 5, &mut second_rng) {
+                seen_second = Some(position);
+            }
+        }
+        assert!(seen_first.is_some());
+        assert_ne!(seen_first, seen_second);
 
-        let first = find_position(&occupied, &candidate, 1, &mut first_rng).unwrap();
-        let second = find_position(&occupied, &candidate, 1, &mut second_rng).unwrap();
-
-        assert_ne!(first, center);
-        assert_ne!(second, center);
-        assert_ne!(first, second);
+        // A window that cannot fit anywhere yields None.
+        assert_eq!(sample_position(&occupied, 200, 5, &mut first_rng), None);
     }
 
     #[test]
@@ -1470,6 +1525,25 @@ mod tests {
                 .random_seed,
             None
         );
+    }
+
+    #[test]
+    fn relative_scaling_auto_follows_repeat() {
+        assert_eq!(
+            WordCloudBuilder::new().relative_scaling,
+            None,
+            "auto by default"
+        );
+        let plain = WordCloudBuilder::new().repeat(false).build().unwrap();
+        let repeated = WordCloudBuilder::new().repeat(true).build().unwrap();
+        assert_eq!(plain.relative_scaling, 0.5);
+        assert_eq!(repeated.relative_scaling, 0.0);
+        let explicit = WordCloudBuilder::new()
+            .repeat(true)
+            .relative_scaling(0.7)
+            .build()
+            .unwrap();
+        assert_eq!(explicit.relative_scaling, 0.7);
     }
 
     #[test]
@@ -1632,6 +1706,71 @@ mod tests {
             let bits = bitmap.bits();
             assert!(!occupied.collides(&bits, word.x, word.y));
             assert!(occupied.insert(&bits, word.x, word.y));
+        }
+    }
+
+    #[test]
+    fn auto_max_font_size_fits_the_canvas_and_is_deterministic() {
+        // A single word is probed at canvas height, then shrunk until it
+        // fits, so its placed size can never exceed the height.
+        let cloud = WordCloud::builder()
+            .dimensions(400, 220)
+            .random_seed(5)
+            .build()
+            .unwrap();
+        let rendered = cloud
+            .generate_detailed_from_frequencies([("wordcloud", 7)])
+            .unwrap();
+        assert_eq!(rendered.words().len(), 1);
+        assert!(rendered.words()[0].font_size <= cloud.height as f32);
+
+        // Several words use the two-word harmonic-mean probe, which stays
+        // below the canvas height as well and reproduces exactly.
+        let frequencies = [("rust", 30), ("safety", 24), ("performance", 20)];
+        let first = cloud
+            .generate_detailed_from_frequencies(frequencies)
+            .unwrap();
+        let second = cloud
+            .generate_detailed_from_frequencies(frequencies)
+            .unwrap();
+        assert!(first.words()[0].font_size <= cloud.height as f32);
+        assert_eq!(first.words(), second.words());
+        assert_eq!(first.image().as_raw(), second.image().as_raw());
+    }
+
+    #[test]
+    fn placement_stops_once_a_word_no_longer_fits() {
+        // A tiny canvas with a large minimum font size: the first words
+        // fill it, then the ladder gives up and remaining words are not
+        // attempted, matching the Python package.
+        let cloud = WordCloud::builder()
+            .dimensions(160, 70)
+            .min_font_size(24.0)
+            .prefer_horizontal(1.0)
+            .random_seed(3)
+            .build()
+            .unwrap();
+        let rendered = cloud
+            .generate_detailed_from_frequencies([
+                ("aaaaaa", 40),
+                ("bbbbbb", 35),
+                ("cccccc", 30),
+                ("dddddd", 25),
+                ("eeeeee", 20),
+                ("ffffff", 15),
+                ("gggggg", 10),
+                ("hhhhhh", 5),
+            ])
+            .unwrap();
+        assert!(!rendered.words().is_empty());
+        assert!(
+            rendered.words().len() < 8,
+            "expected the ladder to give up, placed {}",
+            rendered.words().len()
+        );
+        // Placed words keep descending font sizes.
+        for pair in rendered.words().windows(2) {
+            assert!(pair[0].font_size >= pair[1].font_size);
         }
     }
 
