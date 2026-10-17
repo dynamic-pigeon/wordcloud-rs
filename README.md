@@ -1,5 +1,7 @@
 # wordcloud
 
+简体中文 | [English](README_EN.md)
+
 一个纯 Rust 的词云生成库，以 Python `wordcloud` 1.9.6 为行为基准：从文本或词频生成布局，按频率缩放字号，在 mask 中避碰放置，支持横排/90 度竖排、固定随机种子、自定义字体和颜色，并输出 `image::RgbaImage` 或直接保存图片。默认值与算法语义（分词、collocations、字号阶梯、放置采样）与 Python 版本对齐，剩余差异见下文"与 Python 的已知差异"。
 
 库内嵌 Open Sans，因此英文开箱可用，不依赖操作系统字体。中文等字符需要传入覆盖相应字符的 TTF/OTF/TTC 字体；中文分词应在应用层完成，再把词频交给库。
